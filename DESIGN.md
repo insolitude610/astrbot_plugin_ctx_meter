@@ -36,12 +36,11 @@ AstrBot 的上下文只会越长越贵，但你在聊天里看不见它。想知
 | runner 组装 messages 的顺序 | `astrbot/core/agent/runners/tool_loop_agent_runner.py:313-328` |
 | 工具 schema | `tool_set.openai_schema()` — `astrbot/core/agent/tool.py:203` |
 | 额外内容块序列化 | `Part.model_dump_for_context()` — `astrbot/core/agent/message.py:374` |
-| 最近一次请求的 token 总数 | `Conversation.token_usage` — `astrbot/core/db/po.py:588-589` |
-| 该字段的写入点 | `.../agent_sub_stages/internal.py:639-648` |
 | 掐断默认 LLM | `event.should_call_llm(True)` — `astr_message_event.py:372`，闸门在 `process_stage/stage.py:56-60` |
+| 单次请求的 token 明细 | `ProviderStat` 表 —— 每个 agent 响应插一行：`core/db/sqlite.py:290-332`，插入点 `agent_sub_stages/internal.py:688` |
 | 指令回复的正确写法 | async generator + `yield event.plain_result(...)`（洋葱模型 `pipeline/scheduler.py:44-70`） |
 
-### 3.1 字节数为什么能对齐真实上行
+### 3.1 字节数为什么能对齐真实上行（以及它**不**包含什么）
 
 httpx 发 JSON body 时用的是一组**特定参数**：
 
@@ -50,25 +49,90 @@ httpx 发 JSON body 时用的是一组**特定参数**：
 body = json_dumps(json, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 ```
 
-照抄这组参数，本地算出的字节数就和线上请求体一致。用 `json.dumps` 的**默认**参数会得到
-完全不同的数字（`ensure_ascii=True` 会把中文转义成 `\uXXXX`，长度差近三倍），所以
+照抄这组参数，本地算出的字节数与线上请求体**同一套序列化规则**。用 `json.dumps` 的**默认**参数
+会得到完全不同的数字（`ensure_ascii=True` 会把中文转义成 `\uXXXX`，长度差近三倍），所以
 `measure.py` 把参数固化成常量，并有一条测试专门锁死这件事。
 
-### 3.2 为什么必须用 `should_call_llm` 而不是 `stop_event`
+**它是下界，不是等式。** `total_bytes` 只累加消息面与工具面的五个（外加 `tool_calls_result`）分段，
+不含 provider 信封字段——`model`、`stream`、`stream_options`、`tool_choice`、`temperature`、
+`max_tokens` 等（见 `core/provider/sources/openai_source.py:539-540,624-626`）。
+这些在 400 KB 的请求体上约百字节量级，所以输出用 `≈`，文档也只声称"下界"。
 
-pipeline 是洋葱模型：指令 handler 的 `yield` 会把控制权交出去，**由后续 stage 把消息发出去**。
-在 `yield` 之前调 `stop_event()` 会让调度器直接中断，消息根本发不出去
-（`star_request.py:53` 随后还会 `clear_result()`）。而 `should_call_llm(True)` 只置一个
-`event.call_llm` 标志，不影响回复通道，正好只掐掉"再让模型答一句"。
+### 3.2 `/ctx` 为什么只回一条、且不触发模型
 
-### 3.3 版本下限 `>=4.11.0`
+`/ctx` 的 handler 写成 **async generator**：
 
-逐版本扫过 `_astrbot_hist/v*/`：
+```python
+event.should_call_llm(True)
+yield event.plain_result(text)
+```
 
-- `token_usage` 列：**v4.11.0** 起才有
-- `on_llm_request`、`openai_schema`：v4.0.0 起就有
+pipeline 是洋葱模型（`core/pipeline/scheduler.py:44-70`）：handler 的 `yield` 会把控制权交出去，
+由 `ResultDecorateStage` / `RespondStage`（`core/pipeline/stage_order.py:11-12`）把消息发出去。
 
-所以下限由 `token_usage` 决定。
+**两道闸门，且哪一道生效取决于平台：**
+
+1. **`_has_send_oper`** —— 基类 `send()` 会置 `True`（`astr_message_event.py:500`）。
+   发过消息之后 `process_stage/stage.py:57` 的 `not event._has_send_oper` 就为假，整块跳过。
+2. **`event.call_llm`** —— `should_call_llm(True)` 置位后 `stage.py:59` 的 `not event.call_llm` 为假。
+
+关键在于**平台子类可以重写 `send()` 而漏掉 `_has_send_oper`**：QQ 官方机器人就是这样——
+`platform/sources/qqofficial/qqofficial_message_event.py:215-217` 的 `send()` 只写
+`send_buffer` 再调（已废弃的）`_post_send()`，**既不调 `super().send()` 也不置 `_has_send_oper`**。
+在那条路径上，第一道闸门是开的，**只有 `should_call_llm(True)` 能挡住"指令回完之后又让模型答一句"**。
+
+所以 `should_call_llm(True)` 不是装饰，是**必需的第二个守卫**（代价为零）。
+
+> **一处已修正的早期错误**：本设计初稿声称"用 `event.stop_event()` 代替 `should_call_llm` 会让回复发不出去"。
+> 独立复审指出这是错的：`scheduler.py:60` 的 `break` 只跳出**内层** `async for`，外层 `for i`
+> 仍会继续走到 `ResultDecorateStage` / `RespondStage`，回复照样发得出去。
+> 该论断已从设计中删除。`stop_event()` 真实存在的两个毛病是另外两个，见 §7。
+
+### 3.3 token 数据源：以 `ProviderStat` 为准
+
+`Conversation.token_usage`（`core/db/po.py:588-589`）看着像"最近一次请求的总 token"，但**不可靠**：
+
+- `agent_sub_stages/internal.py:597` 传的是 `None if has_checkpoint else req.conversation.token_usage`，
+  而 `sqlite.py:629` 遇到 `None` 会**跳过该列**，于是旧值原样留着；
+- 写入被 `if runner_stats:` 门控，且在 `internal.py:604`（有 checkpoint）、`internal.py:622`（空回复）
+  会提前返回，**这些轮次根本不更新**。
+
+所以被中断 / 空回复 / checkpoint 的轮次之后，读到的是**更早轮次**的数。
+
+改用 `ProviderStat`：它由 `internal.py:688` 在**每个 agent 响应**后插一行
+（`sqlite.py:290` 注释原文 "Insert a provider stat record for a single agent response"），
+带 `conversation_id`、`token_input_cached`、`token_input_other`、`token_output`、`status`
+（completed / aborted / error）与时间戳。
+
+取值链（每层都 try/except，只读）：
+
+1. `ProviderStat` 里本对话最新一行（`agent_type == "internal"`，按时间倒序取 1 条）→ 显示三段明细 + 状态
+2. 读不到就退回 `Conversation.token_usage` → 标注"**可能来自更早轮次**"
+3. 都没有 → "未知"
+
+### 3.4 版本下限与降级策略（`>=4.11.0`）
+
+逐版本扫过 `_astrbot_hist/v*/`（32 棵树）得到每个 API 的首次出现版本：
+
+| API | 首次出现 | 作用 |
+|---|---|---|
+| `filter.on_llm_request` | v4.0.0 | 测量点 |
+| `ToolSet.openai_schema` | v4.0.0 | 工具段字节 |
+| `event.should_call_llm` | v4.0.0 | 兜底掐断 |
+| `Context.get_db` | v4.0.0 | 读 token |
+| `Conversation.token_usage` | **v4.11.0** | token 退回档 |
+| `ProviderStat` 表 | **v4.22.3** | token 首选档 |
+| `Part.model_dump_for_context` | **v4.24.1** | 额外内容块字节 |
+
+**下限取最老的那个必需项 = v4.11.0。** 其余两个更晚的 API 一律做成优雅降级，
+代价是不能在顶层直接 import（否则 4.11–4.22.2 上直接 `ImportError`，
+而包在 *读* 外围的 try/except 救不了 import 期）：
+
+- `ProviderStat` / `select` / `col` 用 `try: ... except Exception: X = None` 顶层守卫；
+  运行时任一为 `None` 就跳过 ProviderStat 档，直接走 `Conversation.token_usage`
+- 额外内容块按阶梯降级：`model_dump_for_context()`（4.24.1+）→ `model_dump()` → 纯 dict → `str()`
+
+降级只影响**精度**，不影响可用性；`/ctx` 在 4.11.0 上仍然报得出字节数与 token（退回档）。
 
 ## 4. 架构
 
@@ -78,7 +142,7 @@ pipeline 是洋葱模型：指令 handler 的 `yield` 会把控制权交出去�
 ```
 main.py                # Star 子类 + 1 个 hook + 1 个指令
 ctxmeter/measure.py    # 纯函数 measure(req) -> Snapshot
-ctxmeter/render.py     # 纯函数 render(snapshot, token_usage, detail, now) -> str
+ctxmeter/render.py     # 纯函数 render(snapshot, tokens, detail, now) -> str
 tests/                 # 离线 pytest（按仓库惯例不纳入版本管理）
 ```
 
@@ -88,7 +152,8 @@ tests/                 # 离线 pytest（按仓库惯例不纳入版本管理）
 /ctx
  └─ CommandFilter 匹配（wake_prefix "/"）
     └─ handler: should_call_llm(True) → yield plain_result(render(...))
-       └─ 链路已掐断 ⇒ on_llm_request 不为 /ctx 触发 ⇒ 快照始终是上一轮真实请求
+       └─ 链路掐断 ⇒ on_llm_request 不为 /ctx 触发 ⇒ 快照始终是上一轮真实请求
+       └─ 顺带读一条 ProviderStat（只读）
 
 真实对话轮次
  └─ on_llm_request(event, req)
@@ -121,16 +186,20 @@ class Snapshot:
     prompt_bytes: int        # req.prompt
     extra_bytes: int         # req.extra_user_content_parts
     tools_bytes: int         # req.func_tool
+    toolcalls_bytes: int     # req.tool_calls_result（工具续跑附加消息）
     history_messages: int
     tool_count: int
     image_refs: int          # 本轮新附图，只计数
     audio_refs: int
     model: str | None
+    taken_at: float          # 快照时间（time.time()）
 
     @property
-    def total_bytes(self) -> int: ...
+    def total_bytes(self) -> int: ...   # 六段之和；对真实 body 是下界（见 §3.1）
+    @property
+    def sections(self) -> tuple[tuple[str, int], ...]: ...   # 渲染用，零值段由 render 决定是否隐藏
 
-def measure(req) -> Snapshot: ...
+def measure(req, now=None) -> Snapshot: ...
 ```
 
 取值**一律** `getattr(x, name, default)`，保证旧版本和测试桩都不炸。任何一段抛异常
@@ -138,8 +207,21 @@ def measure(req) -> Snapshot: ...
 
 ### 5.2 `render.py`
 
-`render(snapshot, token_usage, detail=True, now=None) -> str`
+```python
+@dataclass(frozen=True, slots=True)
+class Tokens:
+    total: int
+    input_cached: int = 0
+    input_other: int = 0
+    output: int = 0
+    status: str = ""         # completed / aborted / error
+    from_stat: bool = False  # True = 来自 ProviderStat（是"上一次请求"）
+    at: float | None = None
 
+def render(snapshot, tokens, detail=True, now=None) -> str: ...
+```
+
+`detail=True`：
 ```
 📦 当前对话请求体 ≈ 412.6 KB (422,512 bytes)
 ├ 系统提示词    12.4 KB
@@ -147,22 +229,48 @@ def measure(req) -> Snapshot: ...
 ├ 本轮输入       1.2 KB
 ├ 额外内容块     0.3 KB
 └ 工具 Schema   10.6 KB  (7 个)
-🔢 上一次请求 token：118,432
+🔢 上一次请求 token：118,432（缓存输入 98,000 · 其它输入 18,000 · 输出 2,432）
 🖼 本轮附带图片 2 张（尚未编码，未计入）
 🤖 模型 gpt-4o-mini · 快照 14:23:07
 ```
 
 - `detail=False` 只留首行 + token 行
 - `snapshot is None` → "还没有记录到本会话的请求，先随便聊一句再来看看。"
-- `token_usage` 为 `None` 或 `0` → "未知"（`po.py:589` 明确 0 表示未知）
+- token 行三态：
+  - `tokens.from_stat` → `🔢 上一次请求 token：…`（带三段明细）
+  - 退回 `Conversation.token_usage` → `🔢 框架最近记录 token：…（可能来自更早轮次）`
+  - 都没有 → `🔢 token：未知`
+  - `status != "completed"` 时追加 ` · 状态 aborted/error`
 - 字节格式化：`<1 KiB` → B，`<1 MiB` → KB，否则 MB，一位小数
 
 ### 5.3 `main.py`
 
 - `@filter.on_llm_request()`：整段 try/except，测量出问题只 `logger.debug`，绝不影响真实请求
 - `@filter.command("ctx", alias={"请求体", "ctxsize"})`
-- `_read_token_usage`：`conversation_manager` 只读；任一环节异常返回 `None`。
-  **绝不调用 `update_conversation`**
+- `_read_tokens(event)` 两档，全程只读，**绝不调用 `update_conversation` / `insert_provider_stat`**：
+  1. **首选档**：`ProviderStat` 里本对话最新一行（`agent_type == "internal"`，按时间倒序 limit 1）。
+     符号在 4.22.2 及以前不存在，靠顶层守卫置 `None` 后跳过本档。
+  2. **退回档**：`await conversation_manager.get_curr_conversation_id(umo)` →
+     `await conversation_manager.get_conversation(umo, cid)` → `.token_usage`。
+     **必须走 `conversation_manager`，不能 `select(Conversation)`**：`Conversation`
+     （`core/db/po.py:569`）是**非表的普通 dataclass**，真表是 `ConversationV2`；
+     管理器在第 80-90 行把 `conv_v2.token_usage` 映射进这个数据类（`conversation_mgr.py:89`）。
+     直接查库只会静默失败、永远退化成"未知"。
+  3. 两档都失败 → 返回 `None`，渲染成"未知"。
+- DB 访问照抄 core 的写法（`builtin_commands/commands/conversation.py:1-12`），
+  **但全部加顶层守卫**，因为这几个符号在 4.22.2 及以前不存在：
+
+```python
+try:                                            # 4.22.3 起才有这张表
+    from astrbot.core.db.po import ProviderStat
+    from sqlalchemy import select
+    from sqlmodel import col
+except Exception:                               # noqa: BLE001 - 旧版本上必须能 import
+    ProviderStat = select = col = None
+```
+
+`_read_tokens` 在 `ProviderStat is None` 时直接跳过首选档；DB 会话用
+`async with self.context.get_db().get_db() as session:`，整段 try/except。
 
 ## 6. 配置
 
@@ -178,7 +286,11 @@ def measure(req) -> Snapshot: ...
 | 场景 | 行为 |
 |---|---|
 | 本会话还没有真实请求 / 冷启动 / 热重载 | 回提示语，不报错 |
-| `token_usage == 0` | 显示"未知" |
+| 无 `ProviderStat` 行（旧版本 / 从未成功请求） | 退回 `Conversation.token_usage`，并标注可能过期 |
+| 两者都拿不到 | 显示"未知" |
+| AstrBot ≤ 4.22.2（无 `ProviderStat` 表） | 顶层守卫把符号置 `None`，直接走退回档，**不 ImportError** |
+| AstrBot ≤ 4.24.1（无 `model_dump_for_context`） | 额外内容块按 `model_dump()` → dict → `str()` 阶梯降级，字节数为近似值 |
+| 真实 body 的 provider 信封字段 | 不计入 `total_bytes`（见 §3.1），故输出用 `≈` |
 | `req.func_tool` 为 `None` | 工具段为 0 |
 | `openai_schema()` 抛异常 | 退化为工具名字节数 |
 | `req` 缺字段（旧版/桩对象） | `getattr` 兜底为 0 |
@@ -186,6 +298,15 @@ def measure(req) -> Snapshot: ...
 | 会话数超上限 | LRU 淘汰最旧，内存有界 |
 | 插件内任何异常 | hook 侧全包；指令侧只回错误提示 |
 | 非 OpenAI 系 provider | 工具段按 OpenAI schema 估，**偏差仅限工具段** |
+
+**本插件刻意不调 `stop_event()`**，因为框架里它有真实毛病：
+
+- 它会让 `scheduler.py:56` 直接 `break`，于是 **handler 后续 `yield` 的结果再也发不出去**
+  （`stop_event(); yield; yield plain_result` 里第二条会丢）；
+- 若某个第三方 `on_decorating_result` 钩子在装饰阶段停掉事件，`respond/stage.py:329`
+  会跳过 `clear_result`，外层循环回头再次经过装饰/发送阶段，**可能重复发送**。
+
+`should_call_llm(True)` 没有这两个副作用，所以用它。
 
 ## 8. 测试策略
 
@@ -197,18 +318,70 @@ def measure(req) -> Snapshot: ...
 4. `func_tool=None` / `openai_schema` 抛异常 → 不抛
 5. **裸 `object()` 当 req** → 全 0，不抛
 6. 图片/音频只计数、不进字节
-7. `render`：detail 开关、`token_usage=0`、B/KB/MB 边界
-8. 接线：`/ctx` 恰好一次 `should_call_llm(True)` + 恰好一条 `plain_result`
-9. LRU 淘汰
-10. hook 抗炸（measure 抛异常不冒泡）
-11. `admin` 模式下非管理员被拒
+7. `render`：detail 开关、B/KB/MB 边界
+8. **token 三态**：`from_stat=True` 出明细；退回态出"可能来自更早轮次"；都无 → "未知"；
+   `status="aborted"` 追加状态
+9. 接线：`/ctx` 恰好一次 `should_call_llm(True)` + 恰好一条 `plain_result`。
+   **桩事件故意不置 `_has_send_oper`**（模拟 QQ 官方那条重写 `send()` 的路径），
+   断言 `call_llm` 仍被置位——这是防止"指令之后又多一句模型回复"的唯一守卫（§3.2）
+10. LRU 淘汰
+11. hook 抗炸（measure 抛异常不冒泡）
+12. **DB 读失败时静默降级**（桩 session 抛异常 → 仍能出数）
+13. `admin` 模式下非管理员被拒
+14. **符号缺失时模块仍可 import**：monkeypatch `main.ProviderStat = None` → `_read_tokens`
+    走退回档，不抛
+15. **额外内容块降级阶梯**：对象只有 `model_dump()` → 用它；只有 `dict` → 原样；都没有 → `str()`
+16. `tool_calls_result` 非空时计入 `total_bytes`，为空时该段为 0 且渲染隐藏
 
 另外用 AstrBot 的 venv 做 import 冒烟，证明能在真框架里加载。
 
-## 9. 明确不做
+## 9. 复审记录
+
+Level 2 方案闸门第一轮送审，复审器（基础代次 v4-flash）给出两条技术反驳，均已核实并采纳：
+
+1. **"`stop_event()` 会让回复发不出去"是错的。** 已删除该论断，改按 §3.2 的准确解释重写，
+   并把 `stop_event()` 真正的毛病（丢后续 yield、装饰阶段停事件可能重复发送）记进 §7。
+2. **"`Conversation.token_usage` 就是最近一次请求的总量"站不住。** 它会被 checkpoint /
+   中断 / 空回复的轮次跳过写入，残留旧值；`0` 还把"未知"和"真的 0"混在一起。
+   已改为以 `ProviderStat` 最新行为主、`token_usage` 仅作退回并显式标注过期风险。
+
+（该轮 `VERDICT: FAIL` 的另一半原因是送审载荷漏了 `PROPOSER_MODELS` 元数据——属送审方失误，
+已按规则连同修订一起重新送审。）
+
+**第二轮**（补齐元数据后重送，复审器仍为基础代次 v4-flash）判 `VERDICT: FAIL`，
+四条核实结论采纳三条：
+
+3. **字节数下界，不是等式。** `total_bytes` 不含 provider 信封字段（`model` / `stream` /
+   `stream_options` / `tool_choice` 等）与 `tool_calls_result` 消息。已按 §3.1 改写措辞、
+   输出改用 `≈`，并把 `tool_calls_result` 补进分段（第六段）。
+   序列化器本身 CONFIRMED：httpx 用 stdlib json（`_content.py:5,176-183`），
+   openai 2.16.0 走同一路径（`openai/_base_client.py:586`），streaming 只增字段不改编码。
+4. **`>=4.11.0` 下限站不住（唯一必须修的）。** `ProviderStat` 实际是 **v4.22.3** 才有的表、
+   `model_dump_for_context` 是 **v4.24.1**，而顶层 `import` 失败是 `ImportError`，
+   **包在读外围的 try/except 救不了**。已按 §3.4 改为顶层守卫 + 降级阶梯；
+   并独立复扫 32 个版本树确认（`should_call_llm` / `get_db` 都是 v4.0.0）。
+5. **历史图片确实带 data URL** → §4.2 的"自纠正"论证成立，CONFIRMED，未改。
+6. **生命周期无隐患**（Snapshot 只存标量、变更在单个事件循环 tick 内同步完成、
+   上限 64、重载后旧实例可回收）→ 不需要 `terminate()`，CONFIRMED，未改。
+
+**第三轮**（要求复审器对 §3.2 从第一性原理**重新推导**，而不是确认上一轮它自己的归因）
+判 `VERDICT: FAIL`，两条均已在本地独立复核属实并采纳：
+
+7. **§3.2 是过度概括。** 原稿写"`stage.py:56` 那道门本来就进不去"。这只在基类 `send()` 被走到时成立；
+   平台子类可以重写 `send()` 而漏掉 `_has_send_oper`——`qqofficial_message_event.py:215-217`
+   就是这样。**在 QQ 官方平台上 `should_call_llm(True)` 是唯一守卫。**
+   已按 §3.2 改写为"两道闸门、视平台而定"，测试 9 的桩事件也改成不置 `_has_send_oper` 以覆盖该路径。
+8. **退回档必须写明取数路径。** `Conversation`（`core/db/po.py:569`）是非表 dataclass，
+   真表是 `ConversationV2`；写 `select(Conversation)` 会静默失败、永远出"未知"。
+   已按 §5.3 明确为走 `conversation_manager.get_conversation()`（映射见 `conversation_mgr.py:89`）。
+
+**残余风险（未消除，已记录）**：退回档依赖 4.11.0 的 sqlite 实现真的把 `ConversationV2.token_usage`
+写进去了；本机只有 4.28.x 运行环境，未在 4.11.0 上实机执行。影响仅限于退回档显示"未知"。
+另：本文引用的行号均以本机 4.28.2 源码树为准。
+
+## 10. 明确不做
 
 - 不把本轮未落库的图片真去 base64 精确计量（自纠正，且会带来每轮 I/O）
 - 不做 anthropic / gemini 的原生工具 schema 计量
-- 不做 `ProviderStat` 的单次请求 input cached/other/output 拆解
 - 不做 Dashboard 面板
 - 不改动任何现有插件，也不改 AstrBot core
