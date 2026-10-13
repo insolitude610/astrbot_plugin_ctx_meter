@@ -26,8 +26,6 @@ WIRE_DUMPS: dict[str, Any] = {
     "allow_nan": False,
 }
 
-_FALLBACK_DUMPS: dict[str, Any] = {"ensure_ascii": False, "default": str}
-
 # Section labels shown by the renderer, in display order.
 _SECTION_LABELS = (
     "系统提示词",
@@ -38,39 +36,92 @@ _SECTION_LABELS = (
     "工具调用结果",
 )
 
+# "There is a value here, but we cannot express its wire form."  Sections holding
+# one of these contribute nothing, which keeps the total an honest lower bound.
+_SKIP = object()
+
 
 def wire_bytes(obj: Any) -> int:
-    """UTF-8 byte length of ``obj`` as httpx would put it on the wire."""
+    """UTF-8 byte length of ``obj`` as httpx would put it on the wire.
+
+    Returns 0 when the wire kwargs cannot serialize it.  There is deliberately
+    **no** ``default=str`` fallback: httpx has no ``default=`` hook either, so a
+    value that needs one never reaches the wire, and inventing a number for it
+    would break the lower-bound contract.  That is precisely how an earlier
+    revision overcounted ``ToolCallsResult`` by about 57% -- a dataclass repr is
+    longer than the JSON the provider actually appends.
+    """
 
     if obj is None:
         return 0
     try:
         text = json.dumps(obj, **WIRE_DUMPS)
-    except (TypeError, ValueError):
-        try:
-            text = json.dumps(obj, **_FALLBACK_DUMPS)
-        except Exception:
-            return 0
+    except (TypeError, ValueError, RecursionError):
+        return 0
     return len(text.encode("utf-8"))
 
 
+def _call_dump(obj: Any, name: str) -> Any:
+    """Call ``obj.name()`` if it exists and works, else ``_SKIP``."""
+
+    method = getattr(obj, name, None)
+    if not callable(method):
+        return _SKIP
+    try:
+        produced = method()
+    except Exception:
+        return _SKIP
+    return _SKIP if produced is None else produced
+
+
 def _dump_extra_part(part: Any) -> Any:
-    """Serialize one entry of ``req.extra_user_content_parts``.
+    """Wire form of one ``extra_user_content_parts`` entry, or ``_SKIP``.
 
     ``model_dump_for_context`` only exists from AstrBot 4.24.1 on, so older
-    builds step down to ``model_dump``, then to a plain dict, then to ``str``.
+    builds step down to ``model_dump``, then to a plain dict already in wire
+    shape.  A part with none of those contributes nothing rather than a made-up
+    size.
     """
 
     for name in ("model_dump_for_context", "model_dump"):
-        dump = getattr(part, name, None)
-        if callable(dump):
-            try:
-                return dump()
-            except Exception:
-                continue
+        produced = _call_dump(part, name)
+        if produced is not _SKIP:
+            return produced
     if isinstance(part, dict):
         return part
-    return str(part)
+    return _SKIP
+
+
+def _dump_tool_calls(value: Any) -> list | None:
+    """Wire form of ``req.tool_calls_result``, or ``None`` when there is none.
+
+    In 4.28.2 this field holds ``ToolCallsResult`` dataclasses
+    (``core/provider/entities.py:69-91``) whose real wire shape is
+    ``to_openai_messages()`` -- that call is what the provider serializes into the
+    outgoing ``messages`` array.  Handing the dataclass to :func:`wire_bytes`
+    directly would raise ``TypeError`` and, with a lossy fallback, would report a
+    number that is far too large.
+    """
+
+    if value is None:
+        return None
+
+    items = value if isinstance(value, list) else [value]
+    dumped: list = []
+    for item in items:
+        if isinstance(item, dict):
+            dumped.append(item)
+            continue
+        produced = _call_dump(item, "to_openai_messages")
+        if produced is _SKIP:
+            produced = _call_dump(item, "model_dump")
+        if produced is _SKIP:
+            continue
+        if isinstance(produced, list):
+            dumped.extend(produced)
+        else:
+            dumped.append(produced)
+    return dumped or None
 
 
 def _measure_tools(func_tool: Any) -> tuple[int, int]:
@@ -98,9 +149,9 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
         except Exception:
             schema = None
     if schema is None:
-        # Degrade to bare names: still a usable lower bound, never a crash.
+        # Degrade to bare names: a coarse but honest lower bound, never a crash.
         try:
-            schema = [getattr(tool, "name", None) or str(tool) for tool in func_tool]
+            schema = [getattr(tool, "name", None) or "?" for tool in func_tool]
         except Exception:
             schema = []
 
@@ -113,9 +164,12 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
 class Snapshot:
     """What one request would have cost on the wire.
 
-    ``total_bytes`` is a lower bound on the real body: it covers the message and
-    tool sections but not the provider envelope (``model``, ``stream``,
-    ``stream_options``, ``tool_choice``, ``temperature``, ...).
+    ``total_bytes`` is a lower bound on the real body rather than an equality:
+    it covers the message and tool sections but not the provider envelope
+    (``model``, ``stream``, ``stream_options``, ``tool_choice``, ``temperature``,
+    ...).  See DESIGN.md section 3.1 for the configurations where the framework
+    itself trims the request after the snapshot is taken, which makes the number
+    an upper bound on those fields instead.
     """
 
     system_bytes: int = 0
@@ -186,9 +240,12 @@ def measure(req: Any, now: float | None = None) -> Snapshot:
     parts = _as_list(getattr(req, "extra_user_content_parts", None))
     images = _as_list(getattr(req, "image_urls", None))
     audios = _as_list(getattr(req, "audio_urls", None))
-    tool_calls = getattr(req, "tool_calls_result", None)
 
-    dumped_parts = [_dump_extra_part(part) for part in parts]
+    dumped_parts = [
+        dumped for dumped in (_dump_extra_part(part) for part in parts)
+        if dumped is not _SKIP
+    ]
+    tool_calls = _dump_tool_calls(getattr(req, "tool_calls_result", None))
     tools_bytes, tool_count = _measure_tools(getattr(req, "func_tool", None))
 
     return Snapshot(

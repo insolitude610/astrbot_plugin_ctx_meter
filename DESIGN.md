@@ -61,10 +61,25 @@ openai SDK 走同一条路径（`openai/_base_client.py:586` 把 body 交给 `js
 （`ensure_ascii=True` 会把中文转义成 `\uXXXX`，长度差近三倍），所以 `measure.py` 把参数
 固化成常量，并有一条测试专门锁死这件事。
 
-**它是下界，不是等式。** `total_bytes` 只累加消息面与工具面的分段，不含 provider 信封字段
-——`model`、`stream`、`stream_options`、`tool_choice`、`temperature`、`max_tokens` 等
-（见 `core/provider/sources/openai_source.py:539-540,624-626`）。这些在 400 KB 的请求体上
-约百字节量级，所以输出用 `≈`，文档也只声称"下界"。
+**它是"快照那一刻组装好的请求"，两个方向都会偏。**
+
+- **偏小**：不含 provider 信封字段——`model`、`stream`、`stream_options`、`tool_choice`、
+  `temperature`、`max_tokens` 等（见 `core/provider/sources/openai_source.py:539-540,624-626`）。
+  在 400 KB 的请求体上约百字节量级，所以输出用 `≈`。
+- **偏大**：框架在钩子之后仍可能裁剪请求。`tool_schema_mode: skills_like` 会让 runner 把
+  `req.func_tool` 换成不带参数的轻量集（`agent/runners/tool_loop_agent_runner.py:298-306`），
+  而本插件记的是完整 `openai_schema()`；provider 的 `modalities` 不含 `image`/`audio` 时，
+  媒体会被换成 `[Image]`/`[Audio]` 占位符（`provider/modalities.py:86-109`），而不含
+  `tool_use` 时 `func_tool` 直接置空（`tool_loop_agent_runner.py:668-678`）。两处都是本插件偏大。
+  （由终审复审指出，机制已在源码中确认。）
+
+**绝不编数。** 某个分段若既没有 wire 形式的序列化方法、也无法用 `WIRE_DUMPS` 直接编码，
+就**计 0**，而不是退回 `default=str` 硬凑一个值——httpx 并没有 `default=` 钩子，需要它的值
+根本到不了线上，编出来的数只会污染"下界"这个契约。这条规则是有来历的：初版对
+`req.tool_calls_result` 就是这么干的，而 4.28.2 里那个字段是 `ToolCallsResult` dataclass
+（`provider/entities.py:69-91`），其真实线格式是 `to_openai_messages()`；`str()` 兜底会把
+200 字节报成 **360 字节（+80%）**。现在改走 `to_openai_messages()` → `model_dump()`，
+拿不到就计 0，并由导入冒烟脚本对着**真实类**断言（`tests/smoke_import.py`）。
 
 ### 3.2 `/ctx` 为什么只回一条、且不触发模型
 
@@ -136,9 +151,9 @@ sqlalchemy / sqlmodel / ORM 依赖与版本守卫，也少了"该列在有 check
 **下限取最晚的那个必需项 = v4.10.0。** 两个降级项（额外内容块本身、以及它的序列化方法）
 都只走 `getattr` 阶梯，**不需要顶层 import 守卫**：
 
-`model_dump_for_context()`（4.24.1+）→ `model_dump()` → 纯 dict 原样 → `str()`
+`model_dump_for_context()`（4.24.1+）→ `model_dump()` → 纯 dict 原样 → **计 0**
 
-降级只影响**精度**，不影响可用性。
+最后一级是"计 0"而不是 `str()`：见 §3.1 的"绝不编数"。降级只影响**精度**，不影响可用性。
 
 ## 4. 架构
 
@@ -217,6 +232,18 @@ def measure(req, now=None) -> Snapshot: ...
 
 取值**一律** `getattr(x, name, default)`，保证旧版本和测试桩都不炸。任何一段抛异常
 只降级为 0，绝不冒泡。
+
+各分段的序列化规则：
+
+| 分段 | 取值 |
+|---|---|
+| 系统提示词 / 本轮输入 | 本身即字符串，空则不计数 |
+| 历史上下文 | `req.contexts`（已是 OpenAI 格式） |
+| 额外内容块 | 见 §3.4 的阶梯，末级计 0 |
+| 工具 Schema | `openai_schema()`；不可用则退化为工具名列表（粗但诚实） |
+| 工具调用结果 | `to_openai_messages()` → `model_dump()` → dict；末级计 0 |
+
+`wire_bytes()` 在 `WIRE_DUMPS` 编码失败时返回 **0**，没有 `default=str` 兜底（§3.1）。
 
 ### 5.2 `render.py`
 
@@ -352,12 +379,15 @@ class CtxMeterService:
 
 1. **黄金字节数**：手工构造等价 payload，断言 `total_bytes` 与按 `WIRE_DUMPS` 序列化长度相等
 2. **锁死 wire 参数**：含中文时断言**不等于** `json.dumps` 默认参数的长度
-3. `extra_user_content_parts` 走 `model_dump_for_context()`，纯 dict 原样透传
-4. **降级阶梯**：对象只有 `model_dump()` → 用它；只有 dict → 原样；都没有 → `str()`
-5. `func_tool=None` / `openai_schema` 抛异常 → 不抛
+3. `extra_user_content_parts` 走 `model_dump_for_context()`；只有 `model_dump()` 的对象退到它；
+   纯 dict 原样透传；**两者都没有的对象计 0**
+4. **降级阶梯**：见第 3 条；另测 `wire_bytes()` 对无法编码的对象返回 0（绝不编数）
+5. `func_tool=None` / `openai_schema` 抛异常 → 不抛（后者退化为工具名字节数）
 6. **裸 `object()` 当 req** → 全 0，不抛
 7. 图片/音频只计数、不进字节
-8. `tool_calls_result` 非空时计入 `total_bytes`，为空时该段为 0 且渲染隐藏
+8. **工具调用结果按真实形状测**：用镜像 4.28.2 `ToolCallsResult` 的 stub（带
+   `to_openai_messages()`），断言等于其线格式长度；另测裸对象（非 list）也接受、
+   以及无法测量的对象计 0。**这条用例最初用 dict 写，因此漏掉了真实类型**
 9. `render`：detail 开关、B/KB/MB 边界、零值分段隐藏
 10. `Tokens.from_usage`：`usage=None` → `None`；`total == 0`（provider 不报 usage 的全零对象）
     → **也返回 `None`**；正常对象 → 三段 + total 正确
@@ -371,7 +401,8 @@ class CtxMeterService:
     **不是上一轮的旧值**（§3.3 边界 1）
 17. **工具续跑路径**：一轮里 `on_llm_request` 出现两次而 `on_llm_response` 只在末尾一次 →
     断言最终 Entry 的 snapshot 来自**最后一次** request、tokens 来自 response（§3.3 边界 3）
-18. `admin` 模式下非管理员被拒
+18. `admin` 模式下非管理员被拒；`enable=False` 时**两个 hook 都不记录任何东西**
+    （不只是不回复——这条由终审复审指出配置提示与实现不符后补上）
 
 用例分三个文件：`tests/test_measure.py`（字节口径与降级）、`tests/test_render.py`（格式化与
 token 三态）、`tests/test_service.py`（缓存、清空 token、两条边界、开关与权限）。
@@ -455,8 +486,38 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
 要求的两处**非阻塞**文档更正已应用：失败轮次是"回调了但 `usage=None`"（不是不回调）；
 `on_llm_request` 在插件自行发起 LLM 时可跑两次（`stage.py:44,65`）。
 
-**残余风险（未消除，已记录）**：本机只有 4.28.x 运行环境，4.10.0–4.27.x 无法实机冒烟；
-`usage` 的单次调用 vs 整轮累计语义未在真实 provider 上比对。影响均限于 token 行。
+**终审闸门（实现完成后的独立质量复审）第一轮：`VERDICT: FAIL`**，抓到一条真会算错数的
+**MAJOR** 与若干边界问题，全部已修：
+
+7. **`req.tool_calls_result` 的度量口径是错的（MAJOR）。** 4.28.2 里它是 `ToolCallsResult`
+   dataclass（`provider/entities.py:69-91`），真实线格式是 `to_openai_messages()`；初版直接把它
+   交给 `json.dumps`，触发 `default=str` 兜底，**把 200 字节报成 360 字节（+80%）**。
+   更糟的是锁这条行为的测试用的是 dict——**框架永远不会产出那个形状**，所以测试永远不会失败。
+   → 已改为 `to_openai_messages()` → `model_dump()` → 计 0；测试改用镜像真实 dataclass 的
+   stub；并让导入冒烟脚本对着**真实类**断言（实测 `measured=200 wire=200 lossy-would-be=360`）。
+8. **"精确下界"是过度声称（MINOR）。** `tool_schema_mode: skills_like` 会在钩子之后把工具集
+   换成轻量版、provider 的 `modalities` 缺 `image`/`audio` 时媒体被换成占位符——这些都是本插件**偏大**。
+   → §3.1 改为"两个方向都会偏"，README 与 metadata 同步。
+9. **配置提示与实现不符（MINOR）。** `enable` 的 hint 说"两个钩子会直接返回"，但代码只在
+   `view` 里判。→ 改为两个 hook 也判，并补测试。
+10. **设计文档对 `toolcalls_bytes` 的描述不实（MINOR）。** 框架自身的流程里钩子在本轮首个请求上
+    触发，工具结果是**之后**才挂上去的，所以该段通常为 0，只在第三方插件自带
+    `ProviderRequest` 时才有值。→ §5.1 与 README 已按实情改写。
+11. **冒烟脚本把凭据文件搬去了 `%TEMP%`（MINOR，与部署事故同一类）。** 临时根目录从不清理，
+    每次都留下一份 `data/cmd_config.json`（含 `jwt_secret`/`api_key`）。
+    → `finally` 里先 `chdir` 回原目录再 `shutil.rmtree`（Windows 不允许删当前工作目录），
+    并清理了历史残留。
+12. **文档少列一段（NIT）**：渲染器支持六段，README/metadata 只写了五段。→ 已补齐。
+13. **`default=str` 兜底本身不是 wire 行为（NIT）**：httpx 没有 `default=` 钩子，需要它的值
+    根本到不了线上。→ 已整体删除该兜底（见 §3.1 "绝不编数"）。
+
+**残余风险（未消除，已记录）**：
+
+- 本机只有 4.28.x 运行环境，`>=4.10.0` 下限与 4.10–4.27 的行为无法实机冒烟。
+- `usage` 的单次调用 vs 整轮累计语义未在真实 provider 上比对；影响限于 token 行。
+- `skills_like` 与 `modalities` 两处偏大只在源码层面确认，未端到端复现。
+- 终审复审指出 `_astrbot_hist/v*/` 似乎已不在磁盘上；**本 agent 复核后确认它仍在**
+  （31 棵树），§3.4 的版本表可据此复查。
 
 ## 10. 明确不做
 

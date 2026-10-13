@@ -83,6 +83,9 @@ class CtxMeterService:
     def record_request(self, umo: str, req: Any, now: float | None = None) -> None:
         """Snapshot a request that is about to go to the provider.
 
+        A disabled plugin records nothing at all, which is what the ``enable``
+        config hint promises.
+
         The previous round's tokens are dropped in the same step.  A round whose
         provider call fails still fires ``on_llm_response`` but carries no usage,
         so keeping the old value would show this round's bytes next to the last
@@ -93,6 +96,8 @@ class CtxMeterService:
         snapshot time so staleness is visible.
         """
 
+        if not self._enabled():
+            return
         try:
             snapshot = measure(req, now=now if now is not None else time.time())
         except Exception as exc:
@@ -103,6 +108,8 @@ class CtxMeterService:
     def record_response(self, umo: str, usage: Any, now: float | None = None) -> None:
         """Attach the usage of this round's last provider call."""
 
+        if not self._enabled():
+            return
         entry = self._sessions.get(umo)
         if entry is None:
             return
@@ -123,7 +130,7 @@ class CtxMeterService:
     def view(self, event: Any, now: float | None = None) -> str:
         """The text ``/ctx`` should reply with.  Never raises, never writes."""
 
-        if not _as_bool(self._cfg("enable", True)):
+        if not self._enabled():
             return DISABLED
         if self._admin_only() and not self._permitted(event):
             return DENIED
@@ -135,6 +142,9 @@ class CtxMeterService:
             detail=_as_bool(self._cfg("detail", True)),
             now=now if now is not None else time.time(),
         )
+
+    def _enabled(self) -> bool:
+        return _as_bool(self._cfg("enable", True))
 
     def _admin_only(self) -> bool:
         return str(self._cfg("permission_mode", "everyone")).strip().lower() == "admin"
