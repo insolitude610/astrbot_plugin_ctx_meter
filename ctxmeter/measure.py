@@ -122,8 +122,11 @@ def _dump_extra_part(part: Any) -> Any:
         produced = _call_dump(part, name)
         if produced is not _SKIP:
             return produced
-    if isinstance(part, dict):
-        return part
+    try:
+        if isinstance(part, dict):
+            return part
+    except Exception:
+        return _SKIP
     return _SKIP
 
 
@@ -144,20 +147,26 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
             except Exception:
                 count = 0
 
-    schema: Any = None
+    produced: Any = None
     dump = _attr(func_tool, "openai_schema")
     if callable(dump):
         try:
-            schema = _as_list(dump())
+            produced = dump()
         except Exception:
-            schema = None
-    if schema is None:
-        # Degrade to bare names: coarse, but a real part of the schema rather than
-        # a fabricated size.
+            produced = None
+    if produced is None:
+        # No schema at all: missing method, it raised, or it returned None.
+        # Degrade to bare names -- coarse, but a real part of the schema rather
+        # than a fabricated size.  Testing ``produced is None`` rather than
+        # ``not schema`` is deliberate: routing a None return through ``_as_list``
+        # would turn it into an empty list, i.e. "a schema exists but is empty",
+        # and the name fallback would be skipped, silently undercounting.
         try:
             schema = [_as_opt_str(_attr(tool, "name")) or "?" for tool in func_tool]
         except Exception:
             schema = []
+    else:
+        schema = _as_list(produced)
 
     if not schema and count == 0:
         return 0, 0
@@ -215,32 +224,58 @@ class Snapshot:
         )
 
 
-def _as_text(value: Any) -> str:
-    if isinstance(value, str):
+def _to_plain_str(value: Any) -> str:
+    """``value`` as an **exact** ``str``, or ``""``.
+
+    Two separate traps here.  ``str(value)`` dispatches to a subclass's
+    ``__str__`` (which may raise), and even when it succeeds it can hand back the
+    subclass instance itself -- whose ``__bool__`` then explodes at the next
+    ``if system:``.  Calling the base slot explicitly, ``str.__str__(value)``,
+    always yields an exact ``str`` (established by probe under this Python), so
+    every later truthiness test is safe.
+    """
+
+    if type(value) is str:
         return value
-    if value is None:
-        return ""
+    try:
+        return str.__str__(value)
+    except Exception:
+        pass
     try:
         return str(value)
     except Exception:
         return ""
 
 
-def _as_opt_str(value: Any) -> str | None:
-    """``value`` as a non-empty ``str``, or ``None``.
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return _to_plain_str(value)
 
-    Checks ``isinstance`` first so an exotic object never gets a ``__bool__`` or
-    ``__str__`` call that could raise (a multi-element numpy array, say).
+
+def _as_opt_str(value: Any) -> str | None:
+    """``value`` as a non-empty exact ``str``, or ``None``.
+
+    Nothing here calls a dunder the value itself defines: ``str.__str__`` is the
+    base slot, and the truthiness test runs on the plain ``str`` it returns.
     """
 
-    if isinstance(value, str):
-        return value or None
     if value is None:
         return None
+    return _to_plain_str(value) or None
+
+
+def _is_sequence(value: Any) -> bool:
+    """``list``/``tuple`` check that a hostile ``__getattribute__`` cannot break.
+
+    ``isinstance`` resolves ``__class__`` through attribute lookup, so an object
+    that raises there takes the check down with it unless it is wrapped.
+    """
+
     try:
-        return str(value) or None
+        return isinstance(value, (list, tuple))
     except Exception:
-        return None
+        return False
 
 
 def _as_list(value: Any) -> list:
@@ -254,7 +289,7 @@ def _as_list(value: Any) -> list:
 
     if value is None:
         return []
-    if isinstance(value, (list, tuple)):
+    if _is_sequence(value):
         try:
             return list(value)
         except Exception:
