@@ -148,14 +148,14 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
     dump = _attr(func_tool, "openai_schema")
     if callable(dump):
         try:
-            schema = dump()
+            schema = _as_list(dump())
         except Exception:
             schema = None
     if schema is None:
         # Degrade to bare names: coarse, but a real part of the schema rather than
         # a fabricated size.
         try:
-            schema = [_attr(tool, "name") or "?" for tool in func_tool]
+            schema = [_as_opt_str(_attr(tool, "name")) or "?" for tool in func_tool]
         except Exception:
             schema = []
 
@@ -226,13 +226,39 @@ def _as_text(value: Any) -> str:
         return ""
 
 
+def _as_opt_str(value: Any) -> str | None:
+    """``value`` as a non-empty ``str``, or ``None``.
+
+    Checks ``isinstance`` first so an exotic object never gets a ``__bool__`` or
+    ``__str__`` call that could raise (a multi-element numpy array, say).
+    """
+
+    if isinstance(value, str):
+        return value or None
+    if value is None:
+        return None
+    try:
+        return str(value) or None
+    except Exception:
+        return None
+
+
 def _as_list(value: Any) -> list:
+    """``value`` as a **plain** list.
+
+    Normalising here is what keeps the rest of the module safe: once a field is a
+    builtin list, ``len()``, truthiness and iteration downstream cannot surprise
+    us.  A ``list`` subclass whose ``__len__`` or ``__iter__`` raises is caught
+    here instead of escaping from a later ``if contexts``.
+    """
+
     if value is None:
         return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
+    if isinstance(value, (list, tuple)):
+        try:
+            return list(value)
+        except Exception:
+            return []
     return [value]
 
 
@@ -270,6 +296,6 @@ def measure(req: Any, now: float | None = None) -> Snapshot:
         tool_count=tool_count,
         image_refs=len(images),
         audio_refs=len(audios),
-        model=_attr(req, "model") or None,
+        model=_as_opt_str(_attr(req, "model")),
         taken_at=float(now) if now is not None else time.time(),
     )
