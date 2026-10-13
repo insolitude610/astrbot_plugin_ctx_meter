@@ -1,0 +1,20 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local test suite is intentionally not versioned (run it from a working copy).
+tests/
+
+# AstrBot runtime artifacts that must never ship with the plugin:
+# importing astrbot from the plugin directory makes it create ./data/ with a
+# generated cmd_config.json (which contains credential fields).
+data/
+
+# Virtual environments and editor/OS noise
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
