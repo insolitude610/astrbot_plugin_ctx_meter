@@ -4,7 +4,8 @@
 
 本文是本插件的规格书。所有关于 AstrBot 行为的断言都在 4.28.2 源码里核对过（行号以本机
 `D:\AstrBotLauncher-0.1.5.5\AstrBot` 的 4.28.2 树为准），方便日后升级框架时按图索骥。
-文末 §9 记录了独立复审的四轮结论——包括两个被推翻的早期论断。
+文末 §9 记录了独立复审的五轮结论——包括两个被推翻的早期论断，以及一次
+"采纳了复审意见却没核实到底"的教训。
 
 ---
 
@@ -23,7 +24,8 @@ AstrBot 的上下文只会越长越贵，但你在聊天里看不见它。想知
 于是本插件用"记录 + 回放"两步走：
 
 - `@filter.on_llm_request()`：每轮真实请求记一份**字节快照**
-- `@filter.on_llm_response()`：同一轮拿到**这次请求的精确 token**（`LLMResponse.usage`）
+- `@filter.on_llm_response()`：同一轮拿到**末次 provider 调用的 token**（`LLMResponse.usage`，
+  仅成功轮次；与快照可能不是同一次 HTTP 请求，见 §3.3）
 - `/ctx`：把这两样渲染出来
 
 `/ctx` 自己**掐断默认 LLM 链路**（`event.should_call_llm(True)`），所以这两个钩子都不会为它触发，
@@ -85,25 +87,40 @@ pipeline 是洋葱模型（`core/pipeline/scheduler.py:44-70`）：handler 的 `
 2. `_has_send_oper` —— 基类 `send()` 会置 `True`（`astr_message_event.py:500`）。
    这是**顺带**关掉的：只要 `send()` 最终走到基类实现就会置位。
 
-### 3.3 token 数据源：同一个 agent 轮次的 `LLMResponse.usage`
+### 3.3 token 数据源：`LLMResponse.usage`，以及它与字节快照**并不同轮**
 
 `@filter.on_llm_response()`（`star_handler.py:456`，v4.0.0 起就有）以
 `async def handler(self, event, response: LLMResponse)` 回调，`response.usage` 是
-`TokenUsage | None`，含 `input_other` / `input_cached` / `output` 与 `.total`
+`TokenUsage`，含 `input_other` / `input_cached` / `output` 与 `.total`
 （`entities.py:322-351,386`）。这正是 core 自己落库的那个值（写于
 `agent_sub_stages/internal.py:639-648`），但**在进程内直接拿，不需要碰数据库**。
 
-因此本插件**不读** `Conversation.token_usage`，也不用 `ProviderStat`：
+因此本插件**不读** `Conversation.token_usage`，也不用 `ProviderStat`：少了
+sqlalchemy / sqlmodel / ORM 依赖与版本守卫，也少了"该列在有 checkpoint / 被中断 /
+空回复的轮次会被跳过写入、于是读到更早轮次旧值"的问题。
 
-- 少了 sqlalchemy / sqlmodel / ORM 依赖与随之而来的版本守卫；
-- 少了"该列在有 checkpoint / 被中断 / 空回复的轮次会被跳过写入、于是读到更早轮次旧值"的问题；
-- 与字节快照来自**同一轮**，两者天然一致。
+**但它有三个必须写进设计与输出的边界（独立复审指出，均已核实）：**
 
-`usage` 为 `None`（部分 provider / 流式分片）时该行显示"未知"。
+1. **只在成功轮次回调。** `on_llm_response` 走的是成功路径
+   （`tool_loop_agent_runner.py:201` 是唯一的成功回调点；`:894-910` 在 err/abort
+   时提前返回）。所以**失败轮次只更新字节快照、不会更新 token**。
+   → 对策：`on_llm_request` 写新快照时**把 token 一起清空**，失败轮次显示"未知"，
+   而不是把上一轮成功时的 token 拿来配这一轮的字节。
+2. **全零 ≠ None。** provider 不报 usage 时 SDK 给的是 `TokenUsage()`（全零），
+   而不是 `None`（`provider/sources/openai_source.py`: `... if completion.usage else TokenUsage()`）。
+   → 对策：`total == 0` 一并当作"未知"，不显示 `0`。
+3. **它描述的是本轮*最后一次* provider 调用，字节快照描述的是本轮*开头的*那次请求。**
+   带工具调用的轮次里，二者是**不同的两次 HTTP 请求**（字节少算后续请求，token 是末次的值）。
+   → 对策：输出标签写成"**本轮最后一次调用 token**"，并在 README 里说明该差异；
+   不声称两者"天然一致"。
+
+另：钩子对**插件发起的** `event.request_llm` 同样会触发（`process_stage/stage.py:38-48`）。
+**这是有意保留的行为**——`/roll` 这类重新生成本身就是对该会话的一次真实模型请求，
+刷新计数比不刷新更符合直觉。
 
 ### 3.4 版本下限与降级策略（`>=4.10.0`）
 
-逐版本扫过 `_astrbot_hist/v*/`（32 棵树）得到每个 API 的首次出现版本：
+逐版本扫过 `_astrbot_hist/v*/`（**31 棵**树）得到每个 API 的首次出现版本：
 
 | API | 首次出现 | 作用 | 缺失时 |
 |---|---|---|---|
@@ -113,10 +130,11 @@ pipeline 是洋葱模型（`core/pipeline/scheduler.py:44-70`）：handler 的 `
 | `event.should_call_llm` | v4.0.0 | 主守卫 | 必须 |
 | `filter.command(alias=...)` | v4.0.0 | 指令别名 | 必须 |
 | `ToolSet.openai_schema` | v4.0.0 | 工具段字节 | 必须 |
-| `Part.model_dump_for_context` | **v4.24.1** | 额外内容块字节 | 降级 |
+| `ProviderRequest.extra_user_content_parts` | **v4.11.0** | 额外内容块 | `getattr` → 该段计 0 |
+| `Part.model_dump_for_context` | **v4.24.1** | 额外内容块序列化 | 阶梯降级 |
 
-**下限取最晚的那个必需项 = v4.10.0。** 唯一的降级项是额外内容块的序列化，
-按阶梯退化，**不需要顶层 import 守卫**（`model_dump_for_context` 是方法，走 `getattr` 即可）：
+**下限取最晚的那个必需项 = v4.10.0。** 两个降级项（额外内容块本身、以及它的序列化方法）
+都只走 `getattr` 阶梯，**不需要顶层 import 守卫**：
 
 `model_dump_for_context()`（4.24.1+）→ `model_dump()` → 纯 dict 原样 → `str()`
 
@@ -204,7 +222,8 @@ class Tokens:
     output: int = 0
     at: float | None = None
     @classmethod
-    def from_usage(cls, usage, now=None) -> "Tokens | None": ...   # usage 为 None 时返回 None
+    def from_usage(cls, usage, now=None) -> "Tokens | None":
+        """usage 为 None、缺 total、或 total == 0 时返回 None（未知）。"""
 
 def render(snapshot, tokens, detail=True, now=None) -> str: ...
 ```
@@ -217,14 +236,16 @@ def render(snapshot, tokens, detail=True, now=None) -> str: ...
 ├ 本轮输入       1.2 KB
 ├ 额外内容块     0.3 KB
 └ 工具 Schema   10.6 KB  (7 个)
-🔢 上一次请求 token：118,432（缓存输入 98,000 · 其它输入 18,000 · 输出 2,432）
+🔢 本轮最后一次调用 token：118,432（缓存输入 98,000 · 其它输入 18,000 · 输出 2,432）
 🖼 本轮附带图片 2 张（尚未编码，未计入）
 🤖 模型 gpt-4o-mini · 快照 14:23:07
 ```
 
 - `detail=False` 只留首行 + token 行
 - `snapshot is None` → "还没有记录到本会话的请求，先随便聊一句再来看看。"
-- `tokens is None` → `🔢 上一次请求 token：未知`
+- `tokens is None` → `🔢 本轮最后一次调用 token：未知`（含失败轮次、provider 不报 usage）
+- token 行**不写"上一次请求"**：它描述的是本轮末次 provider 调用，与字节快照描述的首个请求
+  可能不是同一次（见 §3.3）
 - 零值分段不在明细里出现（如没有工具就不显示工具行）
 - 字节格式化：`<1 KiB` → B，`<1 MiB` → KB，否则 MB，一位小数
 
@@ -247,8 +268,11 @@ class CtxMeterPlugin(Star):
 
 - 两个 hook 各自**整段 try/except**，出问题只 `logger.debug`，绝不影响真实请求
 - `/ctx` 依次做：`should_call_llm(True)` → 开关 → 权限 → 取 `Entry` → `yield plain_result(...)`
-- 两个 hook 通过 `event.unified_msg_origin` 写同一个 `Entry`；`on_llm_request` 新建
-  （替换旧的 snapshot、**保留旧 tokens 直到同一轮的 response 到达**），`on_llm_response` 只补 tokens
+- 两个 hook 通过 `event.unified_msg_origin` 写同一个 `Entry`
+- `on_llm_request` **整体替换**该 Entry 为 `Entry(snapshot=新, tokens=None)` ——
+  **token 必须一起清空**。否则失败轮次（`on_llm_response` 不回调）会把上一轮成功时的
+  token 配到这一轮的字节上，读起来像是"这次请求花了这些 token"，而那是假的（§3.3 边界 1）
+- `on_llm_response` **只补 tokens**，不动 snapshot
 - 不读数据库，**不调用** `update_conversation` / `insert_provider_stat`，不写会话状态
 
 ## 6. 配置
@@ -266,6 +290,10 @@ class CtxMeterPlugin(Star):
 |---|---|
 | 本会话还没有真实请求 / 冷启动 / 热重载 | 回提示语，不报错 |
 | `response.usage` 为 `None` | token 行显示"未知"，字节部分照常 |
+| provider 不报 usage（`TokenUsage()` 全零） | 同样显示"未知"，**不显示 `0`** |
+| 本轮失败 / 被中断（`on_llm_response` 不回调） | 字节快照已更新、token 显示"未知"（新 Entry 里 token 被清空） |
+| 带工具调用的轮次 | 字节 = 本轮首个请求，token = 本轮末次调用；两者是不同请求，README 已说明 |
+| 插件发起的 `event.request_llm`（如 `/roll`） | **有意**同样刷新该会话的 Entry |
 | AstrBot ≤ 4.24.1（无 `model_dump_for_context`） | 额外内容块按 `model_dump()` → dict → `str()` 降级 |
 | `req.func_tool` 为 `None` | 工具段为 0，明细里不显示该行 |
 | `openai_schema()` 抛异常 | 退化为工具名字节数 |
@@ -298,19 +326,26 @@ class CtxMeterPlugin(Star):
 7. 图片/音频只计数、不进字节
 8. `tool_calls_result` 非空时计入 `total_bytes`，为空时该段为 0 且渲染隐藏
 9. `render`：detail 开关、B/KB/MB 边界、零值分段隐藏
-10. `Tokens.from_usage`：`usage=None` → `None`；正常对象 → 三段 + total 正确
-11. `render(snapshot, None, ...)` → "未知" 且不抛
+10. `Tokens.from_usage`：`usage=None` → `None`；`total == 0`（provider 不报 usage 的全零对象）
+    → **也返回 `None`**；正常对象 → 三段 + total 正确
+11. `render(snapshot, None, ...)` → "未知" 且不抛；**断言输出里不含 `0`**
 12. 接线：`/ctx` 恰好一次 `should_call_llm(True)` + 恰好一条 `plain_result`
 13. LRU 淘汰
 14. 两个 hook 各自抗炸（monkeypatch `measure` 抛异常 → 不冒泡）
-15. `on_llm_response` 保留同一 `Entry` 的 snapshot，只补 tokens
-16. `admin` 模式下非管理员被拒
+15. `on_llm_response` 只补 tokens、不动 snapshot
+16. **失败轮次路径**：先喂一轮 `on_llm_request` + `on_llm_response`（有 token），
+    再只喂一轮 `on_llm_request`（模拟 err/abort，无 response）→ 断言 token 变回"未知"，
+    **不是上一轮的旧值**（§3.3 边界 1）
+17. **工具续跑路径**：一轮里 `on_llm_request` 出现两次而 `on_llm_response` 只在末尾一次 →
+    断言最终 Entry 的 snapshot 来自**最后一次** request、tokens 来自 response（§3.3 边界 3）
+18. `admin` 模式下非管理员被拒
 
 另外用 AstrBot 的 venv 做 import 冒烟，证明能在真框架里加载。
 
-## 9. 独立复审记录（四轮）
+## 9. 独立复审记录（五轮）
 
-方案闸门送审四轮，每轮都被判 `FAIL`，但结论逐轮收敛。以下按"被推翻的是什么"记录。
+方案闸门送审五轮，每轮都被判 `FAIL`，但结论逐轮收敛——第五轮已经把全部承重机制
+独立确认为正确，剩下的只是边界标签。以下按"被推翻的是什么"记录。
 
 **第一轮**：因送审载荷漏掉 `PROPOSER_MODELS` 元数据构成强制 FAIL（送审方失误）。
 技术反驳两条，均已核实采纳：
@@ -341,13 +376,33 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
 4. **采纳复审器提出的更优机制**：用 `@filter.on_llm_response()` 在进程内取
    `LLMResponse.usage`，取代原先"`ProviderStat` 表 + `conversation_manager` 退回"的两档
    DB 方案。该方案删掉了 ORM 依赖、顶层 import 守卫、以及 4.11.0↔4.22.3 的版本纠缠，
-   并把 token 与字节快照绑定到**同一轮**。§3.3 / §5.3 已据此重写。
+   并把 token 与字节快照挂到同一个缓存 Entry 上（**注意**：是同一个"轮次"，
+   不是同一次 HTTP 请求——该区别在第五轮被指出，见下）。§3.3 / §5.3 已据此重写。
    （同时修正了 `select(Conversation)` 的说法：它**会抛异常**，不是静默失败——
    `Conversation` 是非表 dataclass，真表是 `ConversationV2`。）
 
-**残余风险（未消除，已记录）**：`on_llm_response` 每次 agent 轮次回调一次，拿到的是该轮的
-最终 `LLMResponse`；被中断的轮次其 `usage` 语义未在 4.11.0 实机验证。影响仅限于 token 行
-显示"未知"。另：本机只有 4.28.x 运行环境，低版本无法实机冒烟。
+**第五轮**：这一轮把**所有承重机制都独立确认了**——§3.2 的"主守卫与发送路径无关"成立
+（逐个平台 grep 过 `send()`，没有任何平台绕过基类）；`on_llm_request` 每轮恰好一次
+（`internal.py:352`，无逐段派发）；下限 `>=4.10.0` 正确且无别的 API 会抬高它。
+剩下的是三条边界，均已采纳：
+
+5. **`on_llm_response` 只在成功轮次回调**，err / abort / 空输出会跳过
+   （`tool_loop_agent_runner.py:201` 是唯一成功点，`:894-910` 提前返回）。
+   于是失败轮次会出现"新字节 + 旧 token"的误导性组合。
+   → `on_llm_request` 写新 Entry 时**连 token 一起清空**；§5.3、§7、测试 16 已改。
+6. **字节与 token 在带工具的轮次里描述不同的两次请求**（快照取自本轮首个请求，
+   token 取自末次 provider 调用）。原稿"天然一致"的说法不成立。
+   → token 行改标签为"本轮最后一次调用 token"，§3.3 写明差异，新增测试 17。
+7. **全零 ≠ None**：provider 不报 usage 时是 `TokenUsage()` 而非 `None`
+   （`provider/sources/openai_source.py` 的三元表达式，已核实）。
+   → `total == 0` 一并当"未知"；测试 10/11 加了断言。
+   另补齐 §3.4 表（`extra_user_content_parts` 实为 **v4.11.0**）并更正版本树数量
+   （**31 棵**，不是 32）。
+
+**残余风险（未消除，已记录）**：`on_llm_response` 在工具续跑轮次里拿到的是末次调用的
+`usage`，其与"整轮累计"的语义差异未在实机比对；被中断轮次的 `usage` 语义同样未实机验证。
+影响均仅限于 token 行显示"未知"或显示末次值。另：本机只有 4.28.x 运行环境，
+4.10.0–4.27.x 无法实机冒烟。
 
 ## 10. 明确不做
 
