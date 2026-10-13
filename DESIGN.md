@@ -146,11 +146,18 @@ sqlalchemy / sqlmodel / ORM 依赖与版本守卫，也少了"该列在有 check
 能在没装 AstrBot 的环境里跑。
 
 ```
-main.py                # Star 子类 + 2 个 hook + 1 个指令
+__init__.py            # 包标记（AstrBot 以包形式加载 main.py）
+main.py                # Star 子类 + 2 个 hook + 1 个指令（每个都只是转发）
 ctxmeter/measure.py    # 纯函数 measure(req) -> Snapshot
-ctxmeter/render.py     # 纯函数 render(snapshot, tokens, detail, now) -> str
-tests/                 # 离线 pytest（按仓库惯例不纳入版本管理）
+ctxmeter/render.py     # 纯 Tokens / render() / format_bytes()
+ctxmeter/service.py    # CtxMeterService：缓存、开关与权限判定、渲染入口
+tests/                 # 离线 pytest + 导入冒烟（按仓库惯例不纳入版本管理）
 ```
+
+之所以把 hook 的逻辑也放进 `ctxmeter/service.py` 而不是留在 `main.py`：`main.py` 一旦
+`import astrbot`，离线套件就测不了它。放一个无框架依赖的 `CtxMeterService` 进去，
+两个 hook 和指令各剩一行转发，于是**开关、权限、缓存淘汰、清空 token 这些真正会出错的逻辑
+全部可测**——这也是本仓库既有的 `roll/` + `main.py` 分工。
 
 ### 4.1 数据流
 
@@ -249,31 +256,57 @@ def render(snapshot, tokens, detail=True, now=None) -> str: ...
 - 零值分段不在明细里出现（如没有工具就不显示工具行）
 - 字节格式化：`<1 KiB` → B，`<1 MiB` → KB，否则 MB，一位小数
 
-### 5.3 `main.py`
+### 5.3 `main.py` + `service.py`
+
+`main.py` 只做接线，**没有任何判定逻辑留在这一层**——因为它 `import astrbot`，离线套件
+够不着它：
 
 ```python
+@register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION, PLUGIN_REPO)
 class CtxMeterPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig) -> None: ...
-        # self._sessions: OrderedDict[str, Entry]；配置 enable/permission_mode/detail/max_sessions
+    def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
+        super().__init__(context)
+        self._service = CtxMeterService(config=config or {}, logger=logger)
 
-    @filter.on_llm_request()                     # 字节快照
+    @filter.on_llm_request()                      # 一行转发（外套 try/except 兜底）
     async def _record_request(self, event, req) -> None: ...
 
-    @filter.on_llm_response()                    # 同一轮的精确 token
+    @filter.on_llm_response()                     # 一行转发（外套 try/except 兜底）
     async def _record_response(self, event, response) -> None: ...
 
     @filter.command("ctx", alias={"请求体", "ctxsize"})
-    async def ctx(self, event: AstrMessageEvent): ...
+    async def ctx(self, event: AstrMessageEvent):
+        event.should_call_llm(True)
+        yield event.plain_result(self._service.view(event))
 ```
 
-- 两个 hook 各自**整段 try/except**，出问题只 `logger.debug`，绝不影响真实请求
-- `/ctx` 依次做：`should_call_llm(True)` → 开关 → 权限 → 取 `Entry` → `yield plain_result(...)`
-- 两个 hook 通过 `event.unified_msg_origin` 写同一个 `Entry`
-- `on_llm_request` **整体替换**该 Entry 为 `Entry(snapshot=新, tokens=None)` ——
-  **token 必须一起清空**。否则失败轮次（`on_llm_response` 不回调）会把上一轮成功时的
-  token 配到这一轮的字节上，读起来像是"这次请求花了这些 token"，而那是假的（§3.3 边界 1）
-- `on_llm_response` **只补 tokens**，不动 snapshot
-- 不读数据库，**不调用** `update_conversation` / `insert_provider_stat`，不写会话状态
+判定逻辑全在 `CtxMeterService`（无框架依赖，全部经鸭子类型访问）：
+
+```python
+class CtxMeterService:
+    def __init__(self, config=None, logger=None) -> None: ...
+    def record_request(self, umo, req, now=None) -> None      # hook 1
+    def record_response(self, umo, usage, now=None) -> None   # hook 2
+    def view(self, event, now=None) -> str                    # 指令要回的文本
+    def snapshot_for(self, umo) -> Snapshot | None            # 只读；兼作测试探针
+    def tokens_for(self, umo) -> Tokens | None                # 只读；兼作测试探针
+```
+
+行为约定：
+
+- `record_request` **整体替换**该会话的 Entry 为 `Entry(snapshot=新, tokens=None)` ——
+  **token 必须一起清空**。失败轮次照样会回调 `on_llm_response` 但不带 usage，
+  留着旧值就会把上一轮成功的 token 配到这一轮的字节上（§3.3 边界 1）
+- `record_request` 测量失败时**不动**已有 Entry：瞬时故障不该抹掉一个好数字，
+  何况页脚本来就打印快照时间，过期是看得见的
+- `record_response` 只补 tokens，不动 snapshot；usage 未知（`None` 或全零）时保持"未知"
+- `view` 依次判定：开关 → 权限 → 取 Entry → `render`；**只读**，不产生任何写入
+- 缓存是 `OrderedDict[str, Entry]`，两个 `record_*` 都 `move_to_end`，超上限时
+  `popitem(last=False)` 淘汰最久未使用的会话；`Entry` 只存标量，不持有请求或历史对象
+- `max_sessions` 容忍配置界面传回字符串
+- 指令侧：`should_call_llm(True)` → `view(...)`（外面再包一层 try/except，
+  保证**无论如何都会 `yield` 一条 `plain_result`**，绝不静默无回复）
+- 全程**不读数据库**、不调用 `update_conversation` / `insert_provider_stat`、不写会话状态
 
 ## 6. 配置
 
@@ -340,7 +373,12 @@ class CtxMeterPlugin(Star):
     断言最终 Entry 的 snapshot 来自**最后一次** request、tokens 来自 response（§3.3 边界 3）
 18. `admin` 模式下非管理员被拒
 
-另外用 AstrBot 的 venv 做 import 冒烟，证明能在真框架里加载。
+用例分三个文件：`tests/test_measure.py`（字节口径与降级）、`tests/test_render.py`（格式化与
+token 三态）、`tests/test_service.py`（缓存、清空 token、两条边界、开关与权限）。
+
+**导入冒烟**单独成脚本 `tests/smoke_import.py`，用 AstrBot 的 venv 跑（那环境里没有 pytest）：
+它加载真实框架、断言两个 hook 与 `/ctx` 都注册成功、并确认 `/ctx` 挂的是 `CommandFilter`
+（即真的能从聊天触发）。这一层是离线套件够不着的，所以必须实机验。
 
 ## 9. 独立复审记录（五轮）
 

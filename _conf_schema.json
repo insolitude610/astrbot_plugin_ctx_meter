@@ -1,0 +1,27 @@
+{
+  "enable": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 /ctx 只回一句「已关闭」，且不再记录任何快照（两个钩子会直接返回）"
+  },
+  "permission_mode": {
+    "description": "谁可以使用 /ctx",
+    "type": "string",
+    "options": ["everyone", "admin"],
+    "default": "everyone",
+    "hint": "everyone=任何人可用（/ctx 只报尺寸、不报内容，也不消耗 token）；admin=仅 AstrBot 管理员（admins_id 中的用户）可用，其他用户收到权限提示"
+  },
+  "detail": {
+    "description": "是否输出分段明细",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时逐段列出系统提示词 / 历史上下文 / 本轮输入 / 额外内容块 / 工具 Schema；关闭只回总字节数与该轮 token"
+  },
+  "max_sessions": {
+    "description": "快照缓存保留的会话数上限",
+    "type": "int",
+    "default": 64,
+    "hint": "内存里按会话缓存最近一次请求的快照，超出上限时淘汰最久未使用的会话。每条快照只存数字与模型名，不含对话内容"
+  }
+}
