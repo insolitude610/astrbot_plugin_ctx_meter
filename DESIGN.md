@@ -101,9 +101,9 @@ sqlalchemy / sqlmodel / ORM 依赖与版本守卫，也少了"该列在有 check
 
 **但它有三个必须写进设计与输出的边界（独立复审指出，均已核实）：**
 
-1. **只在成功轮次回调。** `on_llm_response` 走的是成功路径
-   （`tool_loop_agent_runner.py:201` 是唯一的成功回调点；`:894-910` 在 err/abort
-   时提前返回）。所以**失败轮次只更新字节快照、不会更新 token**。
+1. **失败轮次也会回调，但 `usage` 是 `None`。** `on_llm_response` 在 err/abort 路径上
+   **照样触发**（`tool_loop_agent_runner.py:1536`、`astr_agent_run_util.py:343`），
+   只是那些回调带的 `usage` 为 `None`。
    → 对策：`on_llm_request` 写新快照时**把 token 一起清空**，失败轮次显示"未知"，
    而不是把上一轮成功时的 token 拿来配这一轮的字节。
 2. **全零 ≠ None。** provider 不报 usage 时 SDK 给的是 `TokenUsage()`（全零），
@@ -291,7 +291,7 @@ class CtxMeterPlugin(Star):
 | 本会话还没有真实请求 / 冷启动 / 热重载 | 回提示语，不报错 |
 | `response.usage` 为 `None` | token 行显示"未知"，字节部分照常 |
 | provider 不报 usage（`TokenUsage()` 全零） | 同样显示"未知"，**不显示 `0`** |
-| 本轮失败 / 被中断（`on_llm_response` 不回调） | 字节快照已更新、token 显示"未知"（新 Entry 里 token 被清空） |
+| 本轮失败 / 被中断 | 回调**会**发生但 `usage` 为 `None`，token 显示"未知"（新 Entry 里 token 已被清空） |
 | 带工具调用的轮次 | 字节 = 本轮首个请求，token = 本轮末次调用；两者是不同请求，README 已说明 |
 | 插件发起的 `event.request_llm`（如 `/roll`） | **有意**同样刷新该会话的 Entry |
 | AstrBot ≤ 4.24.1（无 `model_dump_for_context`） | 额外内容块按 `model_dump()` → dict → `str()` 降级 |
@@ -382,14 +382,15 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
    `Conversation` 是非表 dataclass，真表是 `ConversationV2`。）
 
 **第五轮**：这一轮把**所有承重机制都独立确认了**——§3.2 的"主守卫与发送路径无关"成立
-（逐个平台 grep 过 `send()`，没有任何平台绕过基类）；`on_llm_request` 每轮恰好一次
-（`internal.py:352`，无逐段派发）；下限 `>=4.10.0` 正确且无别的 API 会抬高它。
+（逐个平台 grep 过 `send()`，没有任何平台绕过基类）；`on_llm_request` 在常规路径上每轮一次
+（`internal.py:352`，无逐段派发；注意 `stage.py:44,65` 在插件自行发起 LLM 时会让子阶段跑两次，
+测试 17 覆盖该情形）；下限 `>=4.10.0` 正确且无别的 API 会抬高它。
 剩下的是三条边界，均已采纳：
 
-5. **`on_llm_response` 只在成功轮次回调**，err / abort / 空输出会跳过
-   （`tool_loop_agent_runner.py:201` 是唯一成功点，`:894-910` 提前返回）。
-   于是失败轮次会出现"新字节 + 旧 token"的误导性组合。
-   → `on_llm_request` 写新 Entry 时**连 token 一起清空**；§5.3、§7、测试 16 已改。
+5. **失败轮次的 `usage` 是 `None`**（回调**会**发生——`tool_loop_agent_runner.py:1536`、
+   `astr_agent_run_util.py:343`——只是没有 usage）。于是失败轮次会出现"新字节 + 旧 token"
+   的误导性组合。→ `on_llm_request` 写新 Entry 时**连 token 一起清空**；
+   §3.3、§7、测试 16 已改。（第六轮更正了本条原先"失败轮次不回调"的措辞。）
 6. **字节与 token 在带工具的轮次里描述不同的两次请求**（快照取自本轮首个请求，
    token 取自末次 provider 调用）。原稿"天然一致"的说法不成立。
    → token 行改标签为"本轮最后一次调用 token"，§3.3 写明差异，新增测试 17。
@@ -399,10 +400,25 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
    另补齐 §3.4 表（`extra_user_content_parts` 实为 **v4.11.0**）并更正版本树数量
    （**31 棵**，不是 32）。
 
-**残余风险（未消除，已记录）**：`on_llm_response` 在工具续跑轮次里拿到的是末次调用的
-`usage`，其与"整轮累计"的语义差异未在实机比对；被中断轮次的 `usage` 语义同样未实机验证。
-影响均仅限于 token 行显示"未知"或显示末次值。另：本机只有 4.28.x 运行环境，
-4.10.0–4.27.x 无法实机冒烟。
+**第六轮：`VERDICT: PASS`。** 闸门通过，可以实施。它验证掉了送审方自己提出的
+时序担忧，并确认了前几轮的机制：
+
+- **轮次交错不可达**：会话锁（`internal.py:220`）把 `internal.py:352` 与流式消费都包在内
+  （`respond/stage.py:230` 内联 await；`aiocqhttp_message_event.py:207/221`、
+  `tg_event.py:611-618`、`lark_event.py:1255-1286`），`on_agent_done` 必在锁释放之前，
+  同 umo 事件串行。因此**不需要轮次 ID 关联**。
+- **"有 response 无 request" 无反例**：所有 `on_agent_done` 触发点
+  （`tool_loop_agent_runner.py:201,1536`；`astr_agent_run_util.py:343`；`dify:287`、
+  `coze:324`、`dashscope:359`、`deerflow:129`）都在已派发过 `OnLLMRequestEvent` 的轮次内。
+- `total == 0 → 未知` 安全（真·全零与"未上报"在语义上本就不可区分）。
+- 工具轮次的不对称描述正确（钩子只在本轮首次请求处触发 `:352`；runner 累加于 `:867`
+  但只传末次响应）。
+
+要求的两处**非阻塞**文档更正已应用：失败轮次是"回调了但 `usage=None`"（不是不回调）；
+`on_llm_request` 在插件自行发起 LLM 时可跑两次（`stage.py:44,65`）。
+
+**残余风险（未消除，已记录）**：本机只有 4.28.x 运行环境，4.10.0–4.27.x 无法实机冒烟；
+`usage` 的单次调用 vs 整轮累计语义未在真实 provider 上比对。影响均限于 token 行。
 
 ## 10. 明确不做
 
