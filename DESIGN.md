@@ -216,7 +216,7 @@ tests/                 # 离线 pytest + 导入冒烟（按仓库惯例不纳入
 ```python
 WIRE_DUMPS = {"ensure_ascii": False, "separators": (",", ":"), "allow_nan": False}
 
-def wire_bytes(obj) -> int: ...          # 序列化失败时用 default=str 兜底
+def wire_bytes(obj) -> int: ...          # 编码失败返回 0；无 default=str 兜底（§3.1）
 
 @dataclass(frozen=True, slots=True)
 class Snapshot:
@@ -225,7 +225,6 @@ class Snapshot:
     prompt_bytes: int        # req.prompt
     extra_bytes: int         # req.extra_user_content_parts
     tools_bytes: int         # req.func_tool
-    toolcalls_bytes: int     # req.tool_calls_result（工具续跑附加消息）
     history_messages: int
     tool_count: int
     image_refs: int          # 本轮新附图，只计数
@@ -234,9 +233,9 @@ class Snapshot:
     taken_at: float          # time.time()
 
     @property
-    def total_bytes(self) -> int: ...    # 分段之和；对真实 body 是下界（见 §3.1）
+    def total_bytes(self) -> int: ...    # 五段之和；不等于真实 body（见 §3.1）
     @property
-    def sections(self) -> tuple[tuple[str, int], ...]: ...   # 渲染用
+    def sections(self) -> tuple[tuple[str, int], ...]: ...   # 渲染用，固定五段
 
 def measure(req, now=None) -> Snapshot: ...
 ```
@@ -520,7 +519,8 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
     每次都留下一份 `data/cmd_config.json`（含 `jwt_secret`/`api_key`）。
     → `finally` 里先 `chdir` 回原目录再 `shutil.rmtree`（Windows 不允许删当前工作目录），
     并清理了历史残留。
-12. **文档少列一段（NIT）**：渲染器支持六段，README/metadata 只写了五段。→ 已补齐。
+12. **文档少列一段（NIT）**：当时的渲染器支持六段，README/metadata 只写了五段。
+    （后续第二轮复审把"工具调用结果"整段删掉了，最终就是**五段**；见第 14 条。）
 13. **`default=str` 兜底本身不是 wire 行为（NIT）**：httpx 没有 `default=` 钩子，需要它的值
     根本到不了线上。→ 已整体删除该兜底（见 §3.1 "绝不编数"）。
 
