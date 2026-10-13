@@ -128,7 +128,12 @@ class CtxMeterService:
     # command
     # ------------------------------------------------------------------
     def view(self, event: Any, now: float | None = None) -> str:
-        """The text ``/ctx`` should reply with.  Never raises, never writes."""
+        """The text ``/ctx`` should reply with.
+
+        Pure: it never writes to the conversation, the database or the cache.
+        ``main.py`` still wraps the call, so a failure here produces the fallback
+        reply rather than a silent one.
+        """
 
         if not self._enabled():
             return DISABLED

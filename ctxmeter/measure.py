@@ -49,7 +49,8 @@ _SECTION_LABELS = (
 )
 
 # "There is a value here, but we cannot express its wire form."  Sections holding
-# one of these contribute nothing, which keeps the total an honest lower bound.
+# one of these contribute nothing, which keeps the reported number from claiming
+# more precision than we actually have.
 _SKIP = object()
 
 
@@ -75,14 +76,30 @@ def wire_bytes(obj: Any) -> int:
     try:
         text = json.dumps(obj, **WIRE_DUMPS)
         return len(text.encode("utf-8"))
-    except (TypeError, ValueError, RecursionError):
+    except Exception:
+        # TypeError/ValueError for odd values, UnicodeEncodeError for surrogates,
+        # RecursionError for cycles.  ``BaseException`` is deliberately NOT caught:
+        # swallowing a task cancellation here would be worse than a zero section.
         return 0
+
+
+def _attr(obj: Any, name: str, default: Any = None) -> Any:
+    """``getattr`` that survives a hostile property.
+
+    A third-party plugin can put anything into a ``ProviderRequest`` field, and a
+    property that raises would otherwise escape :func:`measure`.
+    """
+
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
 
 
 def _call_dump(obj: Any, name: str) -> Any:
     """Call ``obj.name()`` if it exists and works, else ``_SKIP``."""
 
-    method = getattr(obj, name, None)
+    method = _attr(obj, name)
     if not callable(method):
         return _SKIP
     try:
@@ -120,7 +137,7 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
     try:
         count = len(func_tool)
     except Exception:
-        names = getattr(func_tool, "names", None)
+        names = _attr(func_tool, "names")
         if callable(names):
             try:
                 count = len(names())
@@ -128,16 +145,17 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
                 count = 0
 
     schema: Any = None
-    dump = getattr(func_tool, "openai_schema", None)
+    dump = _attr(func_tool, "openai_schema")
     if callable(dump):
         try:
             schema = dump()
         except Exception:
             schema = None
     if schema is None:
-        # Degrade to bare names: a coarse but honest lower bound, never a crash.
+        # Degrade to bare names: coarse, but a real part of the schema rather than
+        # a fabricated size.
         try:
-            schema = [getattr(tool, "name", None) or "?" for tool in func_tool]
+            schema = [_attr(tool, "name") or "?" for tool in func_tool]
         except Exception:
             schema = []
 
@@ -152,10 +170,11 @@ class Snapshot:
 
     ``total_bytes`` covers five sections: system prompt, history, this turn's
     input, extra content parts and the tool schema.  It is NOT an equality with
-    whichever body the provider finally sends -- see DESIGN.md section 3.1 for the
-    fields that make it a lower bound, and for the framework settings that make
-    some of those fields an upper bound instead.  ``req.tool_calls_result`` is
-    excluded on purpose (see ``_SECTION_LABELS``).
+    whichever body the provider finally sends, and it is not a clean lower bound
+    either: see DESIGN.md section 3.1 for the provider envelope fields it omits
+    and for the framework settings (``skills_like`` tool trimming, modality
+    placeholders) that make some of those same fields an overcount.
+    ``req.tool_calls_result`` is excluded on purpose (see ``_SECTION_LABELS``).
     """
 
     system_bytes: int = 0
@@ -220,22 +239,26 @@ def _as_list(value: Any) -> list:
 def measure(req: Any, now: float | None = None) -> Snapshot:
     """Take a byte snapshot of a fully built ``ProviderRequest``.
 
-    Never raises: every section degrades to zero on its own, so a shape change in
-    a future AstrBot release cannot break a live conversation.
+    Contract: every *section* degrades to zero on its own, every attribute is read
+    through :func:`_attr`, and nothing here raises for ordinary hostile input --
+    a wrong type, a missing field, a property that raises.  What is NOT swallowed
+    is :class:`BaseException`, so a task cancellation still propagates.  Callers
+    must therefore still contain this call: :meth:`CtxMeterService.record_request`
+    does, and keeps the previous snapshot rather than recording a fake zero.
     """
 
-    system = _as_text(getattr(req, "system_prompt", ""))
-    contexts = _as_list(getattr(req, "contexts", None))
-    prompt = _as_text(getattr(req, "prompt", ""))
-    parts = _as_list(getattr(req, "extra_user_content_parts", None))
-    images = _as_list(getattr(req, "image_urls", None))
-    audios = _as_list(getattr(req, "audio_urls", None))
+    system = _as_text(_attr(req, "system_prompt", ""))
+    contexts = _as_list(_attr(req, "contexts"))
+    prompt = _as_text(_attr(req, "prompt", ""))
+    parts = _as_list(_attr(req, "extra_user_content_parts"))
+    images = _as_list(_attr(req, "image_urls"))
+    audios = _as_list(_attr(req, "audio_urls"))
 
     dumped_parts = [
         dumped for dumped in (_dump_extra_part(part) for part in parts)
         if dumped is not _SKIP
     ]
-    tools_bytes, tool_count = _measure_tools(getattr(req, "func_tool", None))
+    tools_bytes, tool_count = _measure_tools(_attr(req, "func_tool"))
 
     return Snapshot(
         system_bytes=wire_bytes(system) if system else 0,
@@ -247,6 +270,6 @@ def measure(req: Any, now: float | None = None) -> Snapshot:
         tool_count=tool_count,
         image_refs=len(images),
         audio_refs=len(audios),
-        model=getattr(req, "model", None) or None,
+        model=_attr(req, "model") or None,
         taken_at=float(now) if now is not None else time.time(),
     )

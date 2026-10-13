@@ -89,7 +89,9 @@ AstrBot 的上下文只会越长越贵，但你在聊天里看不见它。这个
 
 ## 开发
 
-行为全部在无框架依赖的 `ctxmeter/` 包里，`main.py` 只做接线，所以离线测试不需要装 AstrBot：
+行为全部在无框架依赖的 `ctxmeter/` 包里，`main.py` 只做接线，所以离线测试不需要装 AstrBot。
+**注意 `tests/` 不纳入版本管理**（本仓库惯例，见 `.gitignore`），所以从 GitHub 克隆下来的副本里
+没有测试文件，这两条命令只在本地工作副本里可跑：
 
 ```bash
 python -m pytest tests -q

@@ -550,6 +550,19 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
     → 已把 encode 挪进 try，并补两条用例（孤立代理字符、`__str__` 抛异常的敌意对象）。
     实测：`wire_bytes('a\ud800b') == 0`，快照保留且总数为 5，而修复前是 `snapshot: None`。
 
+17. **第四轮 A 判定 FAIL：`measure` 仍有逃逸路径**，四条全部由复审器的探针复现——
+    `_call_dump` 里的 `getattr` 在 `try` 之外（属性本身抛异常即逃逸）、`measure` 内多处裸
+    `getattr(req, ...)`、`getattr(func_tool, "openai_schema")` 未保护、`except` 抓不住
+    `BaseException`（如 `CancelledError`）。
+    → 引入 `_attr()` 作为全局兜底；`_call_dump` 的 `getattr` 入 `try`；`wire_bytes` 放宽为
+    `except Exception`。**有意不吞 `BaseException`**——吃掉任务取消比丢一个分段更糟。
+    → 并把 `measure` / `view` 的 docstring 从"never raises"改成**准确表述**：分段各自降级、
+    普通敌意输入不抛，但失败由调用方兜住且**保留旧快照**，而不是记一个假的 0。
+    五条探针复跑全部不再抛（含那条 `items()` 抛异常的 dict 子类，返回 2 字节空对象）。
+18. **第四轮 B 判定 PASS**，四条 P3 措辞已修：`measure.py` 里的 "honest lower bound"、
+    冒烟脚本仍说自己在验证尺寸（实际是验证排除）、`conftest` 的 `OpaquePart` 注释、
+    README 没说明 `tests/` 不入库。
+
 **残余风险（未消除，已记录）**：
 
 - 本机只有 4.28.x 运行环境，`>=4.10.0` 下限与 4.10–4.27 的行为无法实机冒烟。
