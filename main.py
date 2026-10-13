@@ -20,8 +20,6 @@ PLUGIN_DESC = (
 PLUGIN_AUTHOR = "insolitude610"
 PLUGIN_REPO = "https://github.com/insolitude610/astrbot_plugin_ctx_meter"
 
-FALLBACK_REPLY = "读取请求体大小失败，请查看插件日志。"
-
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION, PLUGIN_REPO)
 class CtxMeterPlugin(Star):
@@ -61,17 +59,12 @@ class CtxMeterPlugin(Star):
 
     @filter.command("ctx", alias={"请求体", "ctxsize"})
     async def ctx(self, event: AstrMessageEvent):
-        """Report the size of the request body that was last sent."""
+        """Report the size of the request body that was last sent.
 
-        # The primary guard.  Unlike `_has_send_oper`, which is only set when a
-        # send() call reaches the base implementation, this does not depend on
-        # the platform's send path -- so the command can never trigger a second,
-        # model-generated reply.  See DESIGN.md section 3.2.
-        event.should_call_llm(True)
+        One ``yield``, one message.  Everything that decides the outcome --
+        the ``should_call_llm(True)`` guard above all -- lives in
+        ``CtxMeterService.command`` so it can be exercised without AstrBot; see
+        DESIGN.md section 3.2 for why that guard is not optional.
+        """
 
-        try:
-            text = self._service.view(event)
-        except Exception:
-            logger.error(f"{PLUGIN_NAME}: view failed", exc_info=True)
-            text = FALLBACK_REPLY
-        yield event.plain_result(text)
+        yield event.plain_result(self._service.command(event))

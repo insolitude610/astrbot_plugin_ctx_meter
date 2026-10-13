@@ -18,6 +18,7 @@ DEFAULT_MAX_SESSIONS = 64
 
 DISABLED = "请求体计量插件已关闭（/ctx 不可用）。"
 DENIED = "权限不足：/ctx 当前只对管理员开放。"
+FALLBACK_REPLY = "读取请求体大小失败，请查看插件日志。"
 
 
 def _as_bool(value: Any) -> bool:
@@ -127,12 +128,35 @@ class CtxMeterService:
     # ------------------------------------------------------------------
     # command
     # ------------------------------------------------------------------
+    def command(self, event: Any, now: float | None = None) -> str:
+        """Run ``/ctx`` end to end and return the single reply text.
+
+        This lives here, not in ``main.py``, so the two properties that actually
+        matter are testable offline: the command forbids the default LLM chain,
+        and it produces exactly one message.  ``main.py``'s handler is then a
+        single ``yield`` of this method's result.
+
+        The flag is set FIRST and unconditionally.  Even when the report cannot be
+        produced, the agent stage must not be allowed to generate a second reply.
+        """
+
+        try:
+            event.should_call_llm(True)
+        except Exception as exc:
+            self._log("debug", f"ctx meter: could not set the call_llm flag: {exc}")
+
+        try:
+            return self.view(event, now=now)
+        except Exception as exc:
+            self._log("error", f"ctx meter: could not build the report: {exc}")
+            return FALLBACK_REPLY
+
     def view(self, event: Any, now: float | None = None) -> str:
         """The text ``/ctx`` should reply with.
 
         Pure: it never writes to the conversation, the database or the cache.
-        ``main.py`` still wraps the call, so a failure here produces the fallback
-        reply rather than a silent one.
+        :meth:`command` wraps it, so a failure here becomes the fallback reply
+        rather than a silent non-answer.
         """
 
         if not self._enabled():

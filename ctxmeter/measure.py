@@ -67,8 +67,8 @@ def wire_bytes(obj: Any) -> int:
     The ``encode`` call belongs INSIDE the try: ``ensure_ascii=False`` keeps any
     lone surrogate in the string, and ``str.encode`` then raises
     ``UnicodeEncodeError`` (a ``ValueError``).  Text decoded by a platform adapter
-    can carry one, so leaving the encode outside would make ``measure`` raise,
-    which its contract forbids.
+    can carry one, so leaving the encode outside made ``measure`` raise for a
+    perfectly realistic input -- earlier revisions had it outside.
     """
 
     if obj is None:

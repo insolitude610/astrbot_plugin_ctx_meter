@@ -366,7 +366,7 @@ class CtxMeterService:
 | 本轮失败 / 被中断 | 回调**会**发生但 `usage` 为 `None`，token 显示"未知"（新 Entry 里 token 已被清空） |
 | 带工具调用的轮次 | 字节 = 本轮首个请求，token = 本轮末次调用；两者是不同请求，README 已说明 |
 | 插件发起的 `event.request_llm`（如 `/roll`） | **有意**同样刷新该会话的 Entry |
-| AstrBot ≤ 4.24.1（无 `model_dump_for_context`） | 额外内容块按 `model_dump()` → dict → `str()` 降级 |
+| AstrBot ≤ 4.24.1（无 `model_dump_for_context`） | 额外内容块按 `model_dump()` → dict → **计 0** 降级 |
 | `req.func_tool` 为 `None` | 工具段为 0，明细里不显示该行 |
 | `openai_schema()` 抛异常 | 退化为工具名字节数 |
 | `req` 缺字段（旧版/桩对象） | `getattr` 兜底为 0 |
@@ -405,7 +405,14 @@ class CtxMeterService:
 10. `Tokens.from_usage`：`usage=None` → `None`；`total == 0`（provider 不报 usage 的全零对象）
     → **也返回 `None`**；正常对象 → 三段 + total 正确
 11. `render(snapshot, None, ...)` → "未知" 且不抛；**断言输出里不含 `0`**
-12. 接线：`/ctx` 恰好一次 `should_call_llm(True)` + 恰好一条 `plain_result`
+12. **接线，两层覆盖。** 离线侧用 `CtxMeterService.command()` 断言"恰好一次
+    `should_call_llm(True)`"、"报告失败时仍**先**置位守卫"、以及"事件拒收该标志也不炸"
+    （`test_service.py`）；实机侧由导入冒烟脚本驱动**真实注册的** `/ctx` handler，
+    断言 `yields=1`、`replies=1`、`call_llm=[True]`。
+    *这条一开始只写在文档里而没有对应测试*：`main.py` 需要装 AstrBot 才能 import，
+    离线套件够不着，于是 `conftest` 里那两个 fake 成了死代码 —— 也就是说
+    **最核心的两条验收标准（只回一条、不触发模型）当时是零覆盖**。第六轮 B 指出后，
+    判定逻辑下沉进 `CtxMeterService.command()`，`main.py` 的 handler 只剩一次 `yield`。
 13. LRU 淘汰
 14. 两个 hook 各自抗炸（monkeypatch `measure` 抛异常 → 不冒泡）
 15. `on_llm_response` 只补 tokens、不动 snapshot
@@ -593,6 +600,15 @@ AstrBot 的 `ProviderRequest` 字段来自框架与插件，不会长成那样�
 ——任何失败都被调用方兜住、并保留上一份快照，绝不会编出一个数字。所以本设计的目标从来不是
 "`measure` 对任意敌意对象都不抛"，而是"**抛了也不会有后果，且绝不编数**"。这条边界写在这里，
 免得后人把它当成未完成项继续追。
+
+21. **第六轮 B 判定 FAIL，抓到一条真的覆盖漏洞。** §8 声称有一条接线测试断言"恰好一次
+    `should_call_llm(True)` + 恰好一条 `plain_result`"，但**没有任何测试 import `main.py`**
+    ——它要 `import astrbot`，离线套件够不着。`conftest` 里那两个 fake 因此是**死代码**，
+    也就是说"只回一条、不触发模型"这条**最核心的验收标准当时零可执行验证**，冒烟也只证明了注册。
+    → 把判定逻辑下沉为 `CtxMeterService.command()`（先无条件置位守卫、再产文本），
+    `main.py` 的 handler 缩成**一次 `yield`**；离线侧新增四条用例，冒烟脚本改为**直接驱动
+    真实注册的 handler** 并断言 `yields=1`、`replies=1`、`call_llm=[True]`。
+    → 这是本闸门最有价值的一条发现：它指出的不是理论瑕疵，而是**文档声称有测试、实际没有**。
 
 **残余风险（未消除，已记录）**：
 
