@@ -81,10 +81,11 @@ openai SDK 走同一条路径（`openai/_base_client.py:586` 把 body 交给 `js
 
 - 初版把它直接交给 `json.dumps`，触发 `default=str` 兜底。4.28.2 里它是 `ToolCallsResult`
   dataclass（`provider/entities.py:69-91`），`str()` 的 repr 远长于 JSON，**200 字节被报成 360**。
-- 改用 `to_openai_messages()` 后，第二轮复审指出这**仍然不等**于线上形态：provider 之后还会跑
-  `_sanitize_assistant_messages`（`openai_source.py:471-523`，非流式 `:560`、流式 `:618`）
-  与 `_finally_convert_payload`（`:991,1016-1049`），会重写 assistant 的 `content`、
-  **丢弃孤儿 tool 消息**，并在 `:523` 整体替换 `payloads["messages"]`。
+- 改用 `to_openai_messages()` 后，第二轮复审指出这**仍然不等**于线上形态：provider 在真正发起
+  HTTP 之前还会重写整份消息列表——`_sanitize_assistant_messages`（定义于 `openai_source.py:446`，
+  非流式 `:560`、流式 `:618` 调用；`:483-486` 重写 content、`:508-522` **丢弃孤儿 tool 消息**）
+  与 `_finally_convert_payload`（定义于 `:995`、`:991` 调用、`:1016-1049` 改写循环）。
+  （这里只列事实，不声称两者的先后顺序——第三轮终审指出我先前把顺序写反了。）
 - 而这个字段在框架自身的流程里**于快照时刻恒为空**——runner 是在本轮首个请求之后
   （`tool_loop_agent_runner.py:1089`）才把结果挂上去的，钩子早在 `internal.py:352` 就触发了。
 
@@ -536,6 +537,18 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
     README / metadata / §5.1 / §8 全部同步。
     → 教训（第二次同类）：采纳复审意见后仍要从**完整的调用链末端**验证，而不是验证到
     第一个看起来对的函数为止。
+
+15. **第三轮 A 判定 PASS**：确认 §3.1 引用的行号与结论都对（`_sanitize_assistant_messages`
+    定义于 `:446`、应用于 `:560`/`:618`，`:483-486` 改 content、`:508-522` 丢孤儿；
+    `_finally_convert_payload` 定义于 `:995`、`:991` 调用、`:1016-1049` 循环），
+    也确认该字段在钩子时刻确为空、整段排除是可辩护的。两条 P3 措辞已修：
+    补上 `def` 行号，并去掉了我写反的执行顺序。
+16. **第三轮 B 判定 FAIL，抓到真 bug。** `wire_bytes` 把 `text.encode("utf-8")` 写在了 `try`
+    **之外**：`ensure_ascii=False` 会保留孤立代理字符，`.encode` 随即抛 `UnicodeEncodeError`
+    （`ValueError` 的子类，本可被捕获）。平台适配器解码出的文本可能带这种字符，
+    于是 `measure` 违约抛异常，且经 `record_request` 时**整份快照被静默丢弃**。
+    → 已把 encode 挪进 try，并补两条用例（孤立代理字符、`__str__` 抛异常的敌意对象）。
+    实测：`wire_bytes('a\ud800b') == 0`，快照保留且总数为 5，而修复前是 `snapshot: None`。
 
 **残余风险（未消除，已记录）**：
 

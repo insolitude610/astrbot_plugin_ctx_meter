@@ -31,12 +31,15 @@ WIRE_DUMPS: dict[str, Any] = {
 # `req.tool_calls_result` is deliberately NOT a section.  It is empty at hook time
 # in the framework's own flow (the runner appends tool results only after the
 # round's first request), and when a third-party plugin does supply it, its wire
-# form is not `to_openai_messages()` either: the provider runs
-# `_sanitize_assistant_messages` and `_finally_convert_payload` afterwards
-# (openai_source.py:471-523,560,618,991,1016-1049), which can rewrite content and
-# drop orphaned tool messages.  Reproducing that lossy transform to the byte was
-# not worth it for a section that is normally zero, so it is left out entirely
-# rather than reported with a number we cannot stand behind.
+# form is not `to_openai_messages()` either: before the HTTP call the provider
+# rewrites the message list, which can change assistant content and drop orphaned
+# tool messages.  In `astrbot/core/provider/sources/openai_source.py`:
+# `_sanitize_assistant_messages` is defined at :446 and applied at :560
+# (non-stream) and :618 (stream), rewriting content at :483-486 and dropping
+# orphans at :508-522; `_finally_convert_payload` is defined at :995, called at
+# :991, with its rewrite loop at :1016-1049.  Reproducing that lossy transform to
+# the byte was not worth it for a section that is normally zero, so it is left out
+# entirely rather than reported with a number we cannot stand behind.
 _SECTION_LABELS = (
     "系统提示词",
     "历史上下文",
@@ -53,21 +56,27 @@ _SKIP = object()
 def wire_bytes(obj: Any) -> int:
     """UTF-8 byte length of ``obj`` as httpx would put it on the wire.
 
-    Returns 0 when the wire kwargs cannot serialize it.  There is deliberately
+    Returns 0 when the wire kwargs cannot encode it.  There is deliberately
     **no** ``default=str`` fallback: httpx has no ``default=`` hook either, so a
     value that needs one never reaches the wire, and inventing a number for it
     would break the lower-bound contract.  That is precisely how an earlier
-    revision overcounted ``ToolCallsResult`` by about 57% -- a dataclass repr is
-    longer than the JSON the provider actually appends.
+    revision overcounted ``ToolCallsResult`` -- a dataclass repr is longer than
+    the JSON the provider actually appends.
+
+    The ``encode`` call belongs INSIDE the try: ``ensure_ascii=False`` keeps any
+    lone surrogate in the string, and ``str.encode`` then raises
+    ``UnicodeEncodeError`` (a ``ValueError``).  Text decoded by a platform adapter
+    can carry one, so leaving the encode outside would make ``measure`` raise,
+    which its contract forbids.
     """
 
     if obj is None:
         return 0
     try:
         text = json.dumps(obj, **WIRE_DUMPS)
+        return len(text.encode("utf-8"))
     except (TypeError, ValueError, RecursionError):
         return 0
-    return len(text.encode("utf-8"))
 
 
 def _call_dump(obj: Any, name: str) -> Any:
@@ -188,7 +197,14 @@ class Snapshot:
 
 
 def _as_text(value: Any) -> str:
-    return value if isinstance(value, str) else ("" if value is None else str(value))
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return str(value)
+    except Exception:
+        return ""
 
 
 def _as_list(value: Any) -> list:
