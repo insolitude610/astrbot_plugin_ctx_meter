@@ -75,11 +75,22 @@ openai SDK 走同一条路径（`openai/_base_client.py:586` 把 body 交给 `js
 
 **绝不编数。** 某个分段若既没有 wire 形式的序列化方法、也无法用 `WIRE_DUMPS` 直接编码，
 就**计 0**，而不是退回 `default=str` 硬凑一个值——httpx 并没有 `default=` 钩子，需要它的值
-根本到不了线上，编出来的数只会污染"下界"这个契约。这条规则是有来历的：初版对
-`req.tool_calls_result` 就是这么干的，而 4.28.2 里那个字段是 `ToolCallsResult` dataclass
-（`provider/entities.py:69-91`），其真实线格式是 `to_openai_messages()`；`str()` 兜底会把
-200 字节报成 **360 字节（+80%）**。现在改走 `to_openai_messages()` → `model_dump()`，
-拿不到就计 0，并由导入冒烟脚本对着**真实类**断言（`tests/smoke_import.py`）。
+根本到不了线上，编出来的数只会污染"下界"这个契约。
+
+**`req.tool_calls_result` 是唯一被整段排除的字段**，这是两轮终审复审逼出来的结论：
+
+- 初版把它直接交给 `json.dumps`，触发 `default=str` 兜底。4.28.2 里它是 `ToolCallsResult`
+  dataclass（`provider/entities.py:69-91`），`str()` 的 repr 远长于 JSON，**200 字节被报成 360**。
+- 改用 `to_openai_messages()` 后，第二轮复审指出这**仍然不等**于线上形态：provider 之后还会跑
+  `_sanitize_assistant_messages`（`openai_source.py:471-523`，非流式 `:560`、流式 `:618`）
+  与 `_finally_convert_payload`（`:991,1016-1049`），会重写 assistant 的 `content`、
+  **丢弃孤儿 tool 消息**，并在 `:523` 整体替换 `payloads["messages"]`。
+- 而这个字段在框架自身的流程里**于快照时刻恒为空**——runner 是在本轮首个请求之后
+  （`tool_loop_agent_runner.py:1089`）才把结果挂上去的，钩子早在 `internal.py:352` 就触发了。
+
+结论：为一段正常恒为 0 的内容去复刻一个有损清洗器不划算，**整段不量**。
+`measure.py` 的 `_SECTION_LABELS` 顶部写明了这个理由，导入冒烟脚本则用**真实的**
+`ToolCallsResult` 断言它确实没有泄进总数。
 
 ### 3.2 `/ctx` 为什么只回一条、且不触发模型
 
@@ -241,9 +252,10 @@ def measure(req, now=None) -> Snapshot: ...
 | 历史上下文 | `req.contexts`（已是 OpenAI 格式） |
 | 额外内容块 | 见 §3.4 的阶梯，末级计 0 |
 | 工具 Schema | `openai_schema()`；不可用则退化为工具名列表（粗但诚实） |
-| 工具调用结果 | `to_openai_messages()` → `model_dump()` → dict；末级计 0 |
+| 工具调用结果 | **不量**，理由见 §3.1 |
 
 `wire_bytes()` 在 `WIRE_DUMPS` 编码失败时返回 **0**，没有 `default=str` 兜底（§3.1）。
+`Snapshot.sections` 因而固定为**五段**。
 
 ### 5.2 `render.py`
 
@@ -385,9 +397,10 @@ class CtxMeterService:
 5. `func_tool=None` / `openai_schema` 抛异常 → 不抛（后者退化为工具名字节数）
 6. **裸 `object()` 当 req** → 全 0，不抛
 7. 图片/音频只计数、不进字节
-8. **工具调用结果按真实形状测**：用镜像 4.28.2 `ToolCallsResult` 的 stub（带
-   `to_openai_messages()`），断言等于其线格式长度；另测裸对象（非 list）也接受、
-   以及无法测量的对象计 0。**这条用例最初用 dict 写，因此漏掉了真实类型**
+8. **工具调用结果被整段排除**：用镜像 4.28.2 `ToolCallsResult` 的 stub 断言它**不**影响
+   `total_bytes`；导入冒烟脚本再用**真实的** `ToolCallsResult` 复验一次
+   （`without == with`）。**这条用例最初用 dict 写、后来又改成断言 `to_openai_messages()`，
+   两次都没抓住真相**，最终形态见 §3.1
 9. `render`：detail 开关、B/KB/MB 边界、零值分段隐藏
 10. `Tokens.from_usage`：`usage=None` → `None`；`total == 0`（provider 不报 usage 的全零对象）
     → **也返回 `None`**；正常对象 → 三段 + total 正确
@@ -510,6 +523,19 @@ try/except 救不了。（另外确认了：历史图片确实带 data URL，§4
 12. **文档少列一段（NIT）**：渲染器支持六段，README/metadata 只写了五段。→ 已补齐。
 13. **`default=str` 兜底本身不是 wire 行为（NIT）**：httpx 没有 `default=` 钩子，需要它的值
     根本到不了线上。→ 已整体删除该兜底（见 §3.1 "绝不编数"）。
+
+**终审闸门第二轮：`VERDICT: FAIL`**，而且**否掉的正是第一轮我刚采纳的那个修法**：
+
+14. **`to_openai_messages()` 不是该字段的线上形态。** 它确实进了 `messages`
+    （`openai_source.py:979/982` → `:989`），但之后还会被 `_sanitize_assistant_messages`
+    改写（非流式 `:560`、流式 `:618`；`:471-486` 重写 content、`:490-523` **丢弃孤儿 tool
+    消息**、`:523` 整体替换 `payloads["messages"]`），`_finally_convert_payload`
+    （`:991,1016-1049`）还会再改一次。所以即使改用 `to_openai_messages()`，在那种罕见情形下
+    报出的仍是**偏大**的数。
+    → 不复刻有损清洗器，**整段排除**（§3.1）。这同时让"五段"成为事实，
+    README / metadata / §5.1 / §8 全部同步。
+    → 教训（第二次同类）：采纳复审意见后仍要从**完整的调用链末端**验证，而不是验证到
+    第一个看起来对的函数为止。
 
 **残余风险（未消除，已记录）**：
 

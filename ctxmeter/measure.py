@@ -27,13 +27,22 @@ WIRE_DUMPS: dict[str, Any] = {
 }
 
 # Section labels shown by the renderer, in display order.
+#
+# `req.tool_calls_result` is deliberately NOT a section.  It is empty at hook time
+# in the framework's own flow (the runner appends tool results only after the
+# round's first request), and when a third-party plugin does supply it, its wire
+# form is not `to_openai_messages()` either: the provider runs
+# `_sanitize_assistant_messages` and `_finally_convert_payload` afterwards
+# (openai_source.py:471-523,560,618,991,1016-1049), which can rewrite content and
+# drop orphaned tool messages.  Reproducing that lossy transform to the byte was
+# not worth it for a section that is normally zero, so it is left out entirely
+# rather than reported with a number we cannot stand behind.
 _SECTION_LABELS = (
     "系统提示词",
     "历史上下文",
     "本轮输入",
     "额外内容块",
     "工具 Schema",
-    "工具调用结果",
 )
 
 # "There is a value here, but we cannot express its wire form."  Sections holding
@@ -92,38 +101,6 @@ def _dump_extra_part(part: Any) -> Any:
     return _SKIP
 
 
-def _dump_tool_calls(value: Any) -> list | None:
-    """Wire form of ``req.tool_calls_result``, or ``None`` when there is none.
-
-    In 4.28.2 this field holds ``ToolCallsResult`` dataclasses
-    (``core/provider/entities.py:69-91``) whose real wire shape is
-    ``to_openai_messages()`` -- that call is what the provider serializes into the
-    outgoing ``messages`` array.  Handing the dataclass to :func:`wire_bytes`
-    directly would raise ``TypeError`` and, with a lossy fallback, would report a
-    number that is far too large.
-    """
-
-    if value is None:
-        return None
-
-    items = value if isinstance(value, list) else [value]
-    dumped: list = []
-    for item in items:
-        if isinstance(item, dict):
-            dumped.append(item)
-            continue
-        produced = _call_dump(item, "to_openai_messages")
-        if produced is _SKIP:
-            produced = _call_dump(item, "model_dump")
-        if produced is _SKIP:
-            continue
-        if isinstance(produced, list):
-            dumped.extend(produced)
-        else:
-            dumped.append(produced)
-    return dumped or None
-
-
 def _measure_tools(func_tool: Any) -> tuple[int, int]:
     """Return ``(bytes, count)`` for the request's tool set."""
 
@@ -164,12 +141,12 @@ def _measure_tools(func_tool: Any) -> tuple[int, int]:
 class Snapshot:
     """What one request would have cost on the wire.
 
-    ``total_bytes`` is a lower bound on the real body rather than an equality:
-    it covers the message and tool sections but not the provider envelope
-    (``model``, ``stream``, ``stream_options``, ``tool_choice``, ``temperature``,
-    ...).  See DESIGN.md section 3.1 for the configurations where the framework
-    itself trims the request after the snapshot is taken, which makes the number
-    an upper bound on those fields instead.
+    ``total_bytes`` covers five sections: system prompt, history, this turn's
+    input, extra content parts and the tool schema.  It is NOT an equality with
+    whichever body the provider finally sends -- see DESIGN.md section 3.1 for the
+    fields that make it a lower bound, and for the framework settings that make
+    some of those fields an upper bound instead.  ``req.tool_calls_result`` is
+    excluded on purpose (see ``_SECTION_LABELS``).
     """
 
     system_bytes: int = 0
@@ -177,7 +154,6 @@ class Snapshot:
     prompt_bytes: int = 0
     extra_bytes: int = 0
     tools_bytes: int = 0
-    toolcalls_bytes: int = 0
     history_messages: int = 0
     tool_count: int = 0
     image_refs: int = 0
@@ -193,7 +169,6 @@ class Snapshot:
             + self.prompt_bytes
             + self.extra_bytes
             + self.tools_bytes
-            + self.toolcalls_bytes
         )
 
     @property
@@ -209,7 +184,6 @@ class Snapshot:
             self.prompt_bytes,
             self.extra_bytes,
             self.tools_bytes,
-            self.toolcalls_bytes,
         )
 
 
@@ -245,7 +219,6 @@ def measure(req: Any, now: float | None = None) -> Snapshot:
         dumped for dumped in (_dump_extra_part(part) for part in parts)
         if dumped is not _SKIP
     ]
-    tool_calls = _dump_tool_calls(getattr(req, "tool_calls_result", None))
     tools_bytes, tool_count = _measure_tools(getattr(req, "func_tool", None))
 
     return Snapshot(
@@ -254,7 +227,6 @@ def measure(req: Any, now: float | None = None) -> Snapshot:
         prompt_bytes=wire_bytes(prompt) if prompt else 0,
         extra_bytes=wire_bytes(dumped_parts) if dumped_parts else 0,
         tools_bytes=tools_bytes,
-        toolcalls_bytes=wire_bytes(tool_calls) if tool_calls else 0,
         history_messages=len(contexts),
         tool_count=tool_count,
         image_refs=len(images),
