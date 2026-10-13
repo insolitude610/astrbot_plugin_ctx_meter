@@ -227,22 +227,36 @@ class Snapshot:
 def _to_plain_str(value: Any) -> str:
     """``value`` as an **exact** ``str``, or ``""``.
 
-    Two separate traps here.  ``str(value)`` dispatches to a subclass's
-    ``__str__`` (which may raise), and even when it succeeds it can hand back the
-    subclass instance itself -- whose ``__bool__`` then explodes at the next
-    ``if system:``.  Calling the base slot explicitly, ``str.__str__(value)``,
-    always yields an exact ``str`` (established by probe under this Python), so
-    every later truthiness test is safe.
+    Every branch has to end at an exact ``str``, because a later ``if system:``
+    would otherwise call a subclass's ``__bool__``.  Two traps:
+
+    * ``str(value)`` dispatches to ``__str__``, which may raise; and
+    * CPython lets a non-str object's ``__str__`` return a ``str`` **subclass**,
+      so the result of ``str(value)`` cannot be trusted either.
+
+    ``str.__str__(value)`` -- the base slot called explicitly -- always yields an
+    exact ``str`` for a str instance (established by probe), and it raises
+    ``TypeError`` for anything else, which is the fallback path.
     """
 
     if type(value) is str:
         return value
+
+    produced: Any = None
     try:
-        return str.__str__(value)
+        produced = str.__str__(value)
     except Exception:
-        pass
+        try:
+            produced = str(value)
+        except Exception:
+            return ""
+
+    if type(produced) is str:
+        return produced
+
+    # A str subclass got in through __str__; normalise it the same way.
     try:
-        return str(value)
+        return str.__str__(produced)
     except Exception:
         return ""
 
