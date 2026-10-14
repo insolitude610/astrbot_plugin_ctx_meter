@@ -13,10 +13,10 @@
     "hint": "everyone=任何人可用（/ctx 只报尺寸、不报内容，也不消耗 token）；admin=仅 AstrBot 管理员（admins_id 中的用户）可用，其他用户收到权限提示"
   },
   "detail": {
-    "description": "是否输出分段明细",
+    "description": "是否输出分段明细与图片区块",
     "type": "bool",
     "default": true,
-    "hint": "开启时逐段列出系统提示词 / 历史上下文 / 本轮输入 / 额外内容块 / 工具 Schema；关闭只回总字节数与该轮 token"
+    "hint": "开启时逐段列出系统提示词 / 历史上下文 / 本轮输入 / 额外内容块 / 工具 Schema，并附上下文图片张数与 base64 分布；关闭只回总字节数、该轮 token、本轮附带媒体数量和模型/快照时间（分段明细与图片分布都会消失）"
   },
   "max_sessions": {
     "description": "快照缓存保留的会话数上限",

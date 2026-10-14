@@ -1,16 +1,18 @@
 name: astrbot_plugin_ctx_meter
 display_name: 请求体计量 (/ctx)
-short_desc: 发一条 /ctx，看看这轮喂给模型的请求体到底有多大。
+short_desc: 发一条 /ctx，看看这轮喂给模型的请求体到底有多大、上下文里有多少张图片。
 desc: >-
   输入 /ctx 立刻报出当前对话上一次请求的请求体大小：总字节数，以及系统提示词 / 历史上下文 /
-  本轮输入 / 额外内容块 / 工具 Schema 的分段明细，并附该轮最后一次 provider 调用的 token 数
-  与快照时间。按 httpx 真实的 JSON 序列化参数统计，与线上请求体同一套编码规则。
+  本轮输入 / 额外内容块 / 工具 Schema 的分段明细，并附该轮最后一次 provider 调用的 token 数、
+  上下文里的图片张数（历史 / 额外块 / 本轮引用分开计，并标出其中多少张已是 base64）与快照时间。
+  按 httpx 真实的 JSON 序列化参数统计，与线上请求体同一套编码规则。
   量的是快照那一刻组装好的请求：不含 model/stream 等 provider 信封字段（故偏小），
   框架在快照之后改用轻量工具集或替换媒体占位符时则会偏大；工具调用结果一段有意不量
   （快照时刻恒为空，且其线上形态会被 provider 再清洗一次）；拿不准形状的分段一律计 0 而不编数。
+  为看清其它插件注入的内容，本插件的 on_llm_request 钩子注册在 -10000 优先级，即最后执行。
   只读不改：不写会话、不写数据库、不产生额外模型调用。
 author: insolitude610
-version: 1.0.0
+version: 1.1.0
 repo: https://github.com/insolitude610/astrbot_plugin_ctx_meter
 astrbot_version: ">=4.10.0"
 support_platforms:

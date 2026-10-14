@@ -159,6 +159,8 @@ sqlalchemy / sqlmodel / ORM 依赖与版本守卫，也少了"该列在有 check
 | `ToolSet.openai_schema` | v4.0.0 | 工具段字节 | 必须 |
 | `ProviderRequest.extra_user_content_parts` | **v4.11.0** | 额外内容块 | `getattr` → 该段计 0 |
 | `Part.model_dump_for_context` | **v4.24.1** | 额外内容块序列化 | 阶梯降级 |
+| `Part.model_dump()` 的 `image_url` 嵌套形状 | 4.10.0 起 | 图片计数 | 双读 dict / str / attribute |
+| `register_on_llm_request(**kwargs)`（priority） | v4.0.0 | 钩子顺序（§4.2.1） | 六个版本树逐一核对；仍留 `except TypeError` 兜底 |
 
 **下限取最晚的那个必需项 = v4.10.0。** 两个降级项（额外内容块本身、以及它的序列化方法）
 都只走 `getattr` 阶梯，**不需要顶层 import 守卫**：
@@ -202,13 +204,46 @@ tests/                 # 离线 pytest + 导入冒烟（按仓库惯例不纳入
 
 ### 4.2 为什么 hook 里不做 I/O
 
-`req.image_urls` 是本轮附件的**引用**（路径或 URL），要还原成 base64 得读文件。
-每轮都读一遍会让图片 I/O 翻倍，不可接受。
+`req.image_urls` 是本轮附件的**引用**（路径、URL 或第三方 runner 直接给的裸 base64），要还原成
+base64 得读文件。每轮都读一遍会让图片 I/O 翻倍，不可接受。
 
-已落库的历史图片本来就是 data URL，**已经算进 `req.contexts` 了**（`assemble_context`
-在 `provider/entities.py:251-274` 把引用解析成 data URL，`_save_to_history` 原样持久化）；
-只有"本轮新附的图片"会少算一次，而它们在下一轮落库后自然被算准——自纠正。
-所以本轮附件只**单独报数量**，不假装计入字节。
+已落库的历史图片通常本来就是 data URL，**已经算进 `req.contexts` 了**：`assemble_context`
+（`provider/entities.py:192-319`）把引用解析成 data URL，runner 用它的结果构造
+`run_context.messages`（`agent/runners/tool_loop_agent_runner.py:309-323`），而 `_save_to_history`
+保存的正是这批消息（`agent_sub_stages/internal.py:443-450`、`:586`）——本机 `data_v4.db`
+实测：最新会话 113 条消息里 15 个 `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,…"}}`
+块，占 5.87 MB 历史的 95.8%。只有"本轮新附的图片"会少算一次，而它们在下一轮落库后自然被算准
+——自纠正。所以本轮附件只**单独报数量**，不假装计入字节。
+
+### 4.2.1 钩子顺序：为什么必须注册在最后
+
+`on_llm_request` 处理器按注册表顺序派发（`pipeline/context_utils.py:91-101`），而注册表只在注册时
+按 `-extras_configs["priority"]` 稳定排序一次（`star/star_handler.py:19-26`，缺省 0）。插件按
+`os.listdir` 顺序加载（`star/star_manager.py:291-320`），本机日志实测加载顺序为
+`…combine_messages → …forward_reader → …ctx_meter → …qzone_reader → …`：`astrbot_plugin_qzone_reader`
+自己挂 `on_llm_request` 往 `req.extra_user_content_parts` / `req.image_urls` 注入（`main.py:214-240`、
+`:452-465`），于是默认优先级下本插件的快照**发生在它注入之前**，那部分内容完全没被量到。
+
+反例（终审时被推翻的一条，**不是**"转发插件也被漏掉"）：`astrbot_plugin_forward_reader` **没有**
+`on_llm_request` 钩子，它走 `event.request_llm(...)`（`main.py:1190-1231`），该请求由
+`collect_initial_request`（`astr_main_agent.py:1346-1358`）在主 Agent 组装阶段取走，**在钩子之前**，
+因此与钩子顺序无关、一直都被量到。漏掉的只有"自己挂钩子注入"的那一类。
+
+修法：`main.py` 用模块级常量 `LLM_REQUEST_PRIORITY = -10000` 注册（负值 = 更晚执行）。它必须是
+模块级常量而不能读配置：装饰器在 `import` 时执行（`star_manager.py:1132`），而每插件配置要到
+`:1157-1230` 才构造并传给构造函数，import 期根本读不到。
+
+`filter.on_llm_request` 就是 `register_on_llm_request(**kwargs)`
+（`api/event/filter/__init__.py:23` → `star/register/star_handler.py:433-453`，kwargs 落到
+`extras_configs` 于 `:62-68`）。已核对 `_astrbot_hist` 下的 v4.0.0、v4.10.0、v4.11.0、v4.20.0、
+v4.24.1、v4.28.0 六个版本树，全部是 `**kwargs` 签名，故本插件声明的 `>=4.10.0` 范围内该关键字
+一定可用；`main.py` 里仍保留 `try/except TypeError` 兜底并在命中时 `logger.warning`，那条分支属于
+纯防御（命中即说明遇到了未预期的版本，此时会退回加载顺序，可能漏量注入）。
+
+仍然看不见的东西（`render.py` 的盲区声明逐条列出）：优先级更低的处理器、被 `stop_event()` 中断的
+轮次、`plugin_set` 全局「可用插件」白名单排除本插件的轮次、运行器内 `on_agent_begin` 追加的内容、
+工具循环第 2 轮之后的请求体，以及有意不量的 `tool_calls_result`。
+
 
 ## 5. 模块规格
 
@@ -228,18 +263,54 @@ class Snapshot:
     tools_bytes: int         # req.func_tool
     history_messages: int
     tool_count: int
-    image_refs: int          # 本轮新附图，只计数
+    image_refs: int          # len(req.image_urls)：不去重、不过滤（既有契约，敌意输入测试钉住）
     audio_refs: int
     model: str | None
     taken_at: float          # time.time()
+
+    # --- 图片计量（全部带默认值，不改动上面五段的公式） ---
+    history_images: int = 0            # req.contexts 里可读的图片块
+    history_base64: int = 0            # 其中 url 以 data: 开头的
+    history_images_messages: int = 0   # 含图片块的消息条数
+    history_parts_undecodable: int = 0 # url 缺失/空/非 str 的图片块（不计入 history_images）
+    extra_images: int = 0              # extra_user_content_parts 里可读的图片块
+    extra_images_base64: int = 0
+    extra_parts_unsized: bool = False  # 有 part 连 dump 都拿不到
+    current_data_urls: int = 0         # req.image_urls 里已是 data URL 的
 
     @property
     def total_bytes(self) -> int: ...    # 五段之和；不等于真实 body（见 §3.1）
     @property
     def sections(self) -> tuple[tuple[str, int], ...]: ...   # 渲染用，固定五段
+    @property
+    def context_images(self) -> int: ...        # 历史 + 本轮引用 + 额外块
+    @property
+    def context_base64(self) -> int: ...        # 历史 + 额外块里已内嵌的
+    @property
+    def counted_images(self) -> int: ...        # 字符串形态落在五段里的（历史 + 额外块）
+    @property
+    def context_data_urls(self) -> int: ...     # 上面两个口径相加
+    @property
+    def history_serialisable(self) -> bool: ... # history_bytes > 0
+    @property
+    def extra_serialisable(self) -> bool: ...   # extra_bytes > 0
 
+def count_images(contexts, image_urls, parts, dumps_by_index) -> ImageStats: ...
 def measure(req, now=None) -> Snapshot: ...
 ```
+
+图片计数的三条规则（`count_images`，与 `measure` 共用同一批已归一化的列表）：
+
+| 来源 | 规则 |
+|---|---|
+| `req.contexts` | 只扫**列表形态**的 `content`；类型判别 attribute→key 双读，仅 `image_url` / `image` 算图片；url 用 dict→str→attribute 三读，`data:` 前缀计为"已内嵌"；url 缺失/空/非 str 的块计入 `history_parts_undecodable` 而不计入图片数；字符串形态的 `content` **不参与**（v4.10.0 起历史即列表形态，把用户粘贴的 data URL 文本误判成图片是更糟的错） |
+| `req.extra_user_content_parts` | `measure()` 在枚举原始列表时同时产出 `dumped_parts`（**过滤后**的列表，供 `extra_bytes` 用）与 `dumps_by_index`（**原始下标 → 该下标的 wire form**）；`count_images` 按下标取值，只有该下标真的产出了 dump 才算图片，因此拿不到 dump 的 part 既不会计入 `extra_images` 也不会让后面的 part 错位（它只置 `extra_parts_unsized`） |
+| `req.image_urls` | 只做 `len()`（保持既有契约），另数其中 `data:` 开头的数量 |
+
+口径提醒：`history_images` / `extra_images` 的字符串形态分别落在「历史上下文」/「额外内容块」两段
+字节里，而 `image_urls` 里的引用**不在任何分段**（只被 `len()` 读）。渲染层因此把"已计入"的说法
+严格限定在自身分段真的序列化成功的图片上（`B_ok`），失败的那些另起一行（`B_bad`）。
+
 
 取值**一律** `getattr(x, name, default)`，保证旧版本和测试桩都不炸。任何一段抛异常
 只降级为 0，绝不冒泡。
@@ -276,24 +347,50 @@ def render(snapshot, tokens, detail=True, now=None) -> str: ...
 
 `detail=True`：
 ```
-📦 当前对话请求体 ≈ 412.6 KB (422,512 bytes)
-├ 系统提示词    12.4 KB
-├ 历史上下文   388.1 KB  (62 条消息)
-├ 本轮输入       1.2 KB
-├ 额外内容块     0.3 KB
-└ 工具 Schema   10.6 KB  (7 个)
+📦 当前对话请求体 ≈ 5.2 MB (5,423,120 bytes)
+├ 系统提示词    11.7 KB
+├ 历史上下文     5.1 MB  (113 条消息)
+├ 额外内容块     320 B
+└ 工具 Schema   10.5 KB  (24 个)
+🖼 上下文图片 16 张（历史 15 · 额外块 0 · 本轮引用 1）
+   └ 历史图片分布在 6 条消息里
+   └ 历史与额外块中 15 张已是 base64，已计入所在分段
+   └ 本轮引用还有 1 张没有内嵌字节（路径、URL 或裸 base64），其字节未计入任何分段
+   ※ 计数取的是钩子时刻的请求条目：……（盲区声明，见 §4.2）
 🔢 本轮最后一次调用 token：118,432（缓存输入 98,000 · 其它输入 18,000 · 输出 2,432）
-🖼 本轮附带图片 2 张（尚未编码，未计入）
+🖼 本轮附带 1 张图片（其字节未计入）
 🤖 模型 gpt-4o-mini · 快照 14:23:07
 ```
 
-- `detail=False` 只留首行 + token 行
+图片区块的每一行都只在自身条件成立时出现，且**不允许出现自相矛盾的组合**。base64 的
+"已计入/未计入"**按分段分别判定**（`history_bytes` 与 `extra_bytes` 会各自独立地序列化失败）：
+
+| 行 | 条件 |
+|---|---|
+| 父行 `上下文图片 {H+R+E} 张（历史 H · 额外块 E · 本轮引用 R）` | `H + R + E > 0` 或 `extra_parts_unsized` 或 `history_parts_undecodable > 0` |
+| `历史图片分布在 M 条消息里` | `history_images_messages > 1` |
+| `历史与额外块中 ok 张已是 base64，已计入所在分段` | `ok = (history_base64 if history_bytes>0 else 0) + (extra_images_base64 if extra_bytes>0 else 0)`，且 `ok > 0` |
+| `历史与额外块中有 bad 张是 data URL，但所在分段未能序列化，字节计 0` | `bad = (history_base64 + extra_images_base64) - ok`，且 `bad > 0` |
+| `本轮引用里有 K 张已是 data URL，不计入任何分段` | `current_data_urls > 0` |
+| `额外内容块里有无法序列化的块，其字节与图片数都未计入，也无法判断其中是否有图片` | `extra_parts_unsized`（与下一行**各自独立**判定） |
+| `历史里有 K 个图片块读不出地址，未计入` | `history_parts_undecodable > 0` |
+| `本轮引用还有 N 张没有内嵌字节（路径、URL 或裸 base64），其字节未计入任何分段` | `image_refs - current_data_urls > 0` |
+| `历史与额外块（里/中另有）有 N 张不是 data URL：图片本体没内嵌，条目文本仍计入所在分段` | `counted_rest > 0`，其中 `counted_rest` 只累计**序列化成功**那些分段的非 data URL 图片；有内嵌图时用"中另有"，否则用"里的" |
+| `历史与额外块里有 N 张不是 data URL，且所在分段未能序列化，条目文本与字节都没计入` | `failed_rest > 0`，其中 `failed_rest` 只累计**序列化失败**那些分段的非 data URL 图片 |
+
+`image_urls` 与另外两个来源分开成两句，是因为**事实不同**：`image_urls` 只被 `len()` 读过，
+它的引用确实不在任何分段里；而历史/额外块里的图片是**被序列化进各自分段**的，缺的只是图片本体，
+条目文本照样计入——说成"未计入任何分段"就会和同一屏上的分段行自相矛盾。
+
+
+- `detail=False` 只留首行 + token 行 + 本轮媒体句 + 模型/快照页脚（图片区块与盲区声明整体消失）
 - `snapshot is None` → "还没有记录到本会话的请求，先随便聊一句再来看看。"
 - `tokens is None` → `🔢 本轮最后一次调用 token：未知`（含失败轮次、provider 不报 usage）
 - token 行**不写"上一次请求"**：它描述的是本轮末次 provider 调用，与字节快照描述的首个请求
   可能不是同一次（见 §3.3）
 - 零值分段不在明细里出现（如没有工具就不显示工具行）
 - 字节格式化：`<1 KiB` → B，`<1 MiB` → KB，否则 MB，一位小数
+
 
 ### 5.3 `main.py` + `service.py`
 
@@ -307,8 +404,8 @@ class CtxMeterPlugin(Star):
         super().__init__(context)
         self._service = CtxMeterService(config=config or {}, logger=logger)
 
-    @filter.on_llm_request()                      # 一行转发（外套 try/except 兜底）
-    async def _record_request(self, event, req) -> None: ...
+    @_register_recorder                     # 等价于 on_llm_request(priority=LLM_REQUEST_PRIORITY)
+    async def _record_request(self, event, req) -> None: ...   # 一行转发（外套 try/except 兜底）
 
     @filter.on_llm_response()                     # 一行转发（外套 try/except 兜底）
     async def _record_response(self, event, response) -> None: ...
@@ -370,7 +467,7 @@ class CtxMeterService:
 | `req.func_tool` 为 `None` | 工具段为 0，明细里不显示该行 |
 | `openai_schema()` 抛异常 | 退化为工具名字节数 |
 | `req` 缺字段（旧版/桩对象） | `getattr` 兜底为 0 |
-| 本轮带图片/音频 | 单独报"N 张（尚未编码，未计入）" |
+| 本轮带图片/音频 | 分段明细后另起一个图片区块：`上下文图片 N 张（历史 H · 额外块 E · 本轮引用 R）`，逐行说明其中多少张已是 data URL、多少张未计入字节；本轮媒体句子只报数量与"其字节未计入" |
 | 会话数超上限 | LRU 淘汰最旧，内存有界 |
 | 插件内任何异常 | 两个 hook 各自全包；指令侧只回错误提示 |
 | 非 OpenAI 系 provider | 工具段按 OpenAI schema 估，**偏差仅限工具段** |
@@ -643,6 +740,101 @@ AstrBot 的 `ProviderRequest` 字段来自框架与插件，不会长成那样�
 - 终审复审指出 `_astrbot_hist/v*/` 似乎已不在磁盘上；**本 agent 复核后确认它仍在**
   （31 棵树），§3.4 的版本表可据此复查。
 
+## 9.1 第六轮（v1.1.0：注入可见性 + 上下文图片计数）
+
+本轮改的是**计量口径**而不是字节公式：`on_llm_request` 钩子改注册在 `priority = -10000`
+（见 §4.2.1），`Snapshot` 增加 8 个图片计数字段与 6 个派生量（见 §5.1），渲染层新增图片区块
+（见 §5.2）。方案闸门前后送审十余轮，每一轮都由独立复审推翻一个**具体的假话**，最终一轮
+（delta 复审）给出 `PASS`。真正值钱的推翻如下：
+
+1. **"历史图片都是 base64、字节已算准"只对一半。** 历史里的图片形态由持久化路径决定：
+   `assemble_context` 出来的消息被 runner 放进 `run_context.messages` 再落库，所以**用户附的图
+   也是 data URL**（本机 `data_v4.db` 实测 15/16 张），但 `image_urls` 里的**本轮引用**永远
+   不在任何分段里 —— 于是"已计入"的说法只能限定在**自身分段真的序列化成功**的图片上，
+   失败的那些（同段有代理对等让 `json.dumps` 整体失败）必须另起一行。
+2. **"尚未编码"是假话。** 插件、`request_llm` 调用方或第三方 runner 阶段都可能在
+   `image_urls` 里放已经 base64 的引用，于是本轮媒体句只保留恒真的部分（数量 + "其字节未计入"）。
+3. **钩子看到的本轮引用已经过一次图片准备**：`internal.py:287` 在钩子（`:352`）之前跑，会去重并
+   丢弃本地化失败的项；第三方 runner 阶段（`third_party.py:289-307`）则直接给裸 base64。
+   脚注按这两段分别描述，不再笼统说"发送前会替换"。
+4. **`extra_user_content_parts` 的计数必须按下标配对**：`dumped_parts` 过滤掉了跳过的 part，
+   对它 `zip` 会让后面所有 part 错位。
+5. **`isinstance(x, dict)` 在敌意对象上会抛**（`__class__` 走属性查找）——被既有测试
+   `test_measure_survives_a_raising_getattribute` 当场抓住，于是新增 `_is_dict` 与
+   `_looks_like_part` 两个包装，且 `image_urls` 的类型判断也套了 try。
+6. **`payload` 非 str 不能当 URL**：`_to_plain_str` 会把数字转成字符串，导致 `{"url": 42}` 被算成
+   一张图片；改成只接受 exact `str`，其余计入 `history_parts_undecodable`。
+7. **历史 `content` 的项可能是对象而不是 dict**：`Message.content` 的类型是
+   `list[ContentPart]`，落地 JSON 才是 dict，两个分支都得读。
+8. **优先级配置项是死配置**：装饰器在 import 期执行，而每插件配置要到之后才构造，所以
+   `hook_priority` 读不到任何东西 —— 改成模块级常量（并核对 6 个历史版本树的
+   `register_on_llm_request(**kwargs)` 签名一致）。
+
+**复核仍成立的两条**（前文 §4.2 的措辞已同步）：历史图片确实以 data URL 落库；`/ctx` 本身
+不写会话（`_save_to_history` 只在 agent 子阶段跑，`/ctx` 掐断了那条链路）。
+
+### 9.2 终审（Level 2 final gate）推翻的四条
+
+实现完成、本地 100 个离线用例与真框架冒烟全绿之后，终审仍然判 `FAIL`——四条都成立，已逐条改：
+
+1. **"其余 N 张……其字节未计入任何分段"混了两个人群。** 本轮引用（`image_urls`）确实不在任何分段，
+   但历史/额外块里的图片是被**序列化进各自分段**的：只有"图片本体"没内嵌，条目文本本身照样计入。
+   本机实测就是这个形态 —— `prepare_request_images` 在钩子**之前**（`internal.py:287`）把注入的
+   `ImageURLPart` 改写成临时文件路径，于是 `extra_images=1, extra_images_base64=0, extra_bytes>0`，
+   屏幕上同时显示"额外内容块 320 B"和"其字节未计入任何分段"，自相矛盾。
+   → 拆成两行：`其余 N 张本轮引用没有内嵌字节（…），其字节未计入任何分段` 与
+   `历史与额外块另有 N 张不是 data URL：图片本体没内嵌，条目文本仍计入所在分段`，
+   并补两条 render 用例（其中一条正是 `history_bytes>0, history_images=1, history_base64=0`）。
+2. **"读不出地址"的那一行会被无关的 unsized 额外块吞掉。** 原来是
+   `if undecodable and not extra_parts_unsized:`，等于用一个来源的状态去压另一个来源的披露。
+   → 两行各自独立判断。
+3. **`_paired_dumps` 的描述与实现不符**：原实现是"按原始长度遍历、从过滤后的 dump 列表里顺次取"，
+   计数结果正确，但代码里根本没读原始 part，测试名声称的"防止错位"名不副实。
+   → 抽出 `_paired_dumps()` 明确"每个 dump 归属于下一个可 dump 的原始位置"，并把用例加强成
+   5 个 part（dump/miss 交错）以真正钉住配对。
+4. **文档把"转发插件也被漏掉"写错了**：`astrbot_plugin_forward_reader` 没有 `on_llm_request` 钩子，
+   它走 `event.request_llm(...)`，在钩子之前就被组装，一直都被量到。真正被漏掉的只有自己挂钩子
+   注入的那一类（如 `qzone_reader`）。→ README 与 §4.2.1 改成按"框架自带 / `request_llm` /
+   自挂 `on_llm_request`"三类说明，并注明 `priority = -10000` 只影响第三类。
+
+另有一条不改但记录在案：`_is_data_url` 只认 `data:` 前缀，第三方 runner 阶段给的**裸 base64**
+会被归入"没有内嵌字节"那一句。措辞（"路径、URL 或裸 base64"）与事实一致，但**不做**裸 base64
+探测：那要靠启发式猜，与本模块"绝不编数"的原则冲突。
+
+一条测试与版本控制的既有约定：`tests/` 被 `.gitignore` 有意排除（见 §8），因此这些回归用例只在
+工作副本里，不会随插件发布。
+
+### 9.3 终审第二轮：两处仍未闭合，已修
+
+1. **base64 的"已计入/未计入"必须**按分段**判定。** 上一版把两个分段合成一个 `ok`、再用
+   `bad = context_base64 - ok` 倒推，于是"只有一个分段序列化失败"时会把失败那段的图算成成功、
+   把成功那段的图算成失败。反例是公开构造函数就能造出来的：
+   `Snapshot(history_bytes=0, history_images=1, history_base64=1, extra_bytes=320, extra_images=1, extra_images_base64=1)`
+   会同时打印"1 张已是 base64，已计入所在分段"与"1 张……所在分段未能序列化"——一条对一个。
+   → 改成 `hist_ok` / `extra_ok` 各自判定，`ok`、`bad` 由两者相加/相减；并补三条 render 用例
+   （反向失败、正向失败、仅引用），其中两条正是终审给的反例。
+2. **额外块的配位仍是"顺次发放"，会漏算。** 上一版的 `_paired_dumps` 把过滤后的 dump 按顺序发给
+   下一个"可 dump"的位置，于是 `[拿不到 dump 的 part, 能 dump 的图片 part]` 会把那份 dump 记在
+   第 0 位，`extra_images` 反而变 0（比 v1.0.0 的 `zip` 还差）。
+   → `measure()` 改为显式记录**原始下标 → dump** 的映射（`dumps_by_index`）并传给 `count_images`，
+   只有该下标真的产出了 dump 才算图；`_paired_dumps` 删除。新增
+   `test_count_images_only_counts_a_position_that_actually_dumped` 与 5-part 交错用例钉住。
+
+### 9.4 终审第三轮：最后一格矩阵补上
+
+- **"非 data URL 的图片仍然计入所在分段"这句话也得按分段判定。** 上面 9.3 只把 **base64**
+  那一对行做了分段拆分；非 base64 的 remainder 仍用 `hist + extra` 一个总数，于是
+  "分段序列化失败 × 该段里是非 base64 图片"这一格会说假话：`Snapshot(history_bytes=0, history_images=1)`
+  会打印"条目文本仍计入所在分段"，而同一屏上**根本没有**「历史上下文」那一行。
+  端到端可达：`measure(FakeRequest(extra_user_content_parts=[MdfcPart("x\ud800"), ImagePart("C:/tmp/a.png")]))`
+  → `extra_bytes == 0` 且 `extra_images == 1`。
+  → 拆成 `counted_rest`（只累计序列化成功那些分段）与 `failed_rest`（只累计失败那些分段），
+  两条各自的文案；新增三条 render 用例（仅引用 / 失败段里的非 base64 图 / 只有额外块失败）。
+- 同轮还修了三处文档漂移（`count_images` 签名与 `dumps_by_index`、父行条件漏了
+  `history_parts_undecodable`、`detail=False` 残留的页脚说明）与一处 `isinstance` 未走 `_is_str`。
+
+
+
 ## 10. 明确不做
 
 - 不读数据库（`ProviderStat` / `Conversation.token_usage` 都不用）
@@ -650,3 +842,5 @@ AstrBot 的 `ProviderRequest` 字段来自框架与插件，不会长成那样�
 - 不做 anthropic / gemini 的原生工具 schema 计量
 - 不做 Dashboard 面板
 - 不改动任何现有插件，也不改 AstrBot core
+- 不覆盖工具调用循环第 2 轮之后的请求体、压缩后的历史、更晚注册/更低优先级的
+  `on_llm_request` 处理器（快照只描述钩子时刻的那一个请求，README 与输出脚注都写明）

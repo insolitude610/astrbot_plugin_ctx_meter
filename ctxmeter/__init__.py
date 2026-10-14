@@ -4,7 +4,7 @@
 with a plain ``python -m pytest`` and no AstrBot installation.
 """
 
-from .measure import WIRE_DUMPS, Snapshot, measure, wire_bytes
+from .measure import WIRE_DUMPS, ImageStats, Snapshot, count_images, measure, wire_bytes
 from .render import NO_DATA, Tokens, format_bytes, render
 from .service import CtxMeterService, Entry
 
@@ -13,8 +13,10 @@ __all__ = [
     "WIRE_DUMPS",
     "CtxMeterService",
     "Entry",
+    "ImageStats",
     "Snapshot",
     "Tokens",
+    "count_images",
     "format_bytes",
     "measure",
     "render",
